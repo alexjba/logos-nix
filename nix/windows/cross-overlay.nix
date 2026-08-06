@@ -122,7 +122,12 @@ in
   pkg-config-unwrapped = prev.pkg-config-unwrapped.overrideAttrs (old: {
     env = (old.env or { }) // {
       NIX_CFLAGS_COMPILE =
-        (old.env.NIX_CFLAGS_COMPILE or "") + " -Wno-error=incompatible-pointer-types";
+        (old.env.NIX_CFLAGS_COMPILE or "")
+        + " -Wno-error=incompatible-pointer-types"
+        # Same file, second GCC 14 promotion: `passing argument 2 of
+        # '_InterlockedCompareExchangePointer' makes pointer from integer
+        # without a cast [-Wint-conversion]`.
+        + " -Wno-error=int-conversion";
     };
   });
 

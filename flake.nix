@@ -40,13 +40,24 @@
       # This is a SEPARATE `import` of the SAME pinned nixpkgs — not a second
       # nixpkgs pin. The overlays never reach a repo's ordinary `pkgs`, so
       # native Linux/macOS closures are unaffected by Windows support existing.
+      # The BUILD-side overlay is only needed where wine is unavailable (see
+      # native-overlay.nix). Applying it unconditionally would be actively
+      # harmful: it changes the NATIVE glib's hash, which invalidates the
+      # binary cache for everything downstream of glib on the build platform
+      # -- gtk3, gdk-pixbuf, at-spi2-core, json-glib, graphviz ... -- and those
+      # then rebuild from source purely to produce a Windows artifact.
+      #
+      # wine64.meta.platforms is [x86_64-linux x86_64-darwin], so only
+      # aarch64-darwin needs it.
+      needsNativeOverlay = buildSystem: buildSystem == "aarch64-darwin";
+
       mkWindowsPkgs =
         { buildSystem
         , libc ? windowsCrossSystem.libc
         }: import nixpkgs {
           localSystem = buildSystem;
           crossSystem = windowsCrossSystem // { inherit libc; };
-          overlays = [ windowsNativeOverlay ]; # BUILD-side fixes
+          overlays = nixpkgs.lib.optional (needsNativeOverlay buildSystem) windowsNativeOverlay;
           crossOverlays = [ windowsCrossOverlay ]; # HOST-side fixes
         };
 
