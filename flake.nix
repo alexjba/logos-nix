@@ -8,15 +8,26 @@
     # exception to this repo's "never add a separate nixpkgs pin" rule, scoped
     # so it can never reach a Linux or macOS build.
     #
-    # Why: Qt 6.9.2 loads plugins with a bare LoadLibrary, so a module in its
-    # own directory cannot resolve a vendored DLL sitting next to it — measured
-    # on real Windows, Nix-built 6.9.2:
-    #     mode=plain  -> LOAD=FAILURE "The specified module could not be found."
-    #     mode=adddll -> LOAD=SUCCESS
-    # Qt fixed this by 6.11.1, where plain loading succeeds unaided. Taking
-    # 6.11.1 for Windows removes the need to call SetDefaultDllDirectories +
-    # AddDllDirectory before every QPluginLoader::load() across logos-module,
-    # logos-basecamp and logos-module-loader-qt.
+    # Why: this pin exists for upstream's mingw cross fixes, which our native
+    # pin predates — notably the libjpeg-turbo mingw-boolean.patch repair that
+    # landed 2026-01-09. Without it the overlay has to carry that patch itself.
+    #
+    # IT IS *NOT* HERE TO FIX W1 (plugin DLL search), whatever an earlier
+    # revision of this comment claimed. Qt loads plugins with a bare
+    # LoadLibrary, so a module in its own directory cannot resolve a vendored
+    # DLL sitting beside it. That was measured on real Windows against Nix-built
+    # 6.9.2, and the belief that 6.11.1 fixed it came from an MSYS2 build — the
+    # exact proxy this repo's own Stage 0b lesson says never to trust for
+    # Qt-internals questions. Re-measured 2026-08-06 on real Windows against
+    # THIS pin's Nix-built Qt 6.11.1 (QT_RUNTIME=6.11.1, verified off
+    # Qt6Core.dll's version resource), module dir isolated:
+    #     plain                          -> LOAD=FAILURE "The specified module
+    #                                       could not be found."
+    #     LOAD_WITH_ALTERED_SEARCH_PATH  -> LOAD=SUCCESS, vendored DLL resolved
+    #                                       from the module's own directory
+    #     vendored DLL moved next to exe -> LOAD=SUCCESS  (control)
+    # So W1 is real at 6.11.1 and is fixed in code, in logos-module's
+    # LogosModule::loadFromPath (see src/win_dll_search.cpp), not by this pin.
     #
     # Cost: Windows ships Qt 6.11.1 while Linux/macOS stay on 6.9.2, and
     # logos-cpp-sdk notes "the QRO wire is Qt-version-sensitive". Every process
