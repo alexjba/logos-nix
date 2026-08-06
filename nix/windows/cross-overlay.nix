@@ -51,6 +51,37 @@ let
     };
 in
 {
+  # CMake flags every Qt-consuming Logos repo needs when cross-compiling.
+  #
+  # Qt splits each module's TOOLS into a separate package -- e.g.
+  #     Qt6RemoteObjectsDependencies.cmake:
+  #     set(__qt_RemoteObjects_tool_deps "Qt6RemoteObjectsTools;<ver>")
+  # -- and those tools (repc, qmltyperegistrar, qsb, moc) must RUN on the build
+  # machine, so under cross they live in the build-platform Qt, not the mingw
+  # one. Without these flags find_package(Qt6 COMPONENTS RemoteObjects) fails
+  # with a thoroughly misleading message:
+  #     Expected Config file at <qtbase>/lib/cmake/Qt6RemoteObjects ... does
+  #     NOT exist
+  # The TARGET config is found fine; it is the HOST tool package that is not.
+  #
+  # Exposed on the package set (rather than as a logos-nix lib function) so a
+  # consumer can write `pkgs.logosQtCrossCmakeFlags or []` and have it degrade
+  # to nothing on a native build without threading logos-nix through.
+  logosQtCrossCmakeFlags = lib.optionals isCross (
+    [ "-DQT_HOST_PATH=${final.pkgsBuildBuild.qt6.qtbase}" ]
+    ++ [
+      ("-DQT_ADDITIONAL_HOST_PACKAGES_PREFIX_PATH="
+        + lib.concatStringsSep ";" (
+            map (m: "${final.pkgsBuildBuild.qt6.${m}}") [
+              "qtbase"
+              "qtremoteobjects"
+              "qtdeclarative"
+              "qtshadertools"
+              "qtsvg"
+            ]))
+    ]
+  );
+
   # Header-only, but upstream declares `platforms = platforms.unix`
   # (pkgs/by-name/cl/cli11/package.nix).  Direct logosctl dependency, and not
   # covered by logos-co/nixpkgs@mingw-integration.
@@ -98,6 +129,27 @@ in
     configureFlags =
       (builtins.filter (f: !(lib.hasPrefix "--with-tcl" f)) (old.configureFlags or [ ]))
       ++ [ "--disable-tcl" ];
+  });
+
+  # libwebp's CLI tools (img2webp, gif2webp, ...) fail to link on mingw with
+  # undefined WebPMux*/WebPAnimEncoder* references. Only the LIBRARY is ever
+  # consumed here -- the tools are not installed and nothing in the Qt closure
+  # invokes them -- so switch them off rather than chase the link.
+  #
+  # Ported from logos-co/nixpkgs@mingw-integration, which carries the same fix
+  # upstream-style (NixOS/nixpkgs#476343). Later -D flags win on the cmake
+  # command line, so appending is enough to override the ON values computed
+  # from pngSupport/gifSupport above.
+  libwebp = prev.libwebp.overrideAttrs (old: {
+    cmakeFlags = (old.cmakeFlags or [ ]) ++ [
+      (lib.cmakeBool "WEBP_BUILD_CWEBP" false)
+      (lib.cmakeBool "WEBP_BUILD_DWEBP" false)
+      (lib.cmakeBool "WEBP_BUILD_GIF2WEBP" false)
+      (lib.cmakeBool "WEBP_BUILD_IMG2WEBP" false)
+      (lib.cmakeBool "WEBP_BUILD_VWEBP" false)
+      (lib.cmakeBool "WEBP_BUILD_WEBPINFO" false)
+      (lib.cmakeBool "WEBP_BUILD_WEBPMUX" false)
+    ];
   });
 
   qt6 = prev.qt6.overrideScope (
