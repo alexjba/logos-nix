@@ -87,6 +87,23 @@ in
   # covered by logos-co/nixpkgs@mingw-integration.
   cli11 = widenPlatforms prev.cli11;
 
+  # stduuid is header-only, so nothing of it should be COMPILED at all -- but
+  # its CMakeLists defaults UUID_BUILD_TESTS to UUID_MAIN_PROJECT, which is ON
+  # whenever it is the top-level project, i.e. always in nixpkgs. The test
+  # target then does
+  #     if (WIN32) ... /EHc /Zc:hiddenFriend
+  # treating WIN32 as a synonym for MSVC, and mingw's g++ reads those as input
+  # FILENAMES:
+  #     x86_64-w64-mingw32-g++: error: /EHc: linker input file not found
+  #
+  # nixpkgs passes -DBUILD_TESTING=OFF, which stduuid does not consult (CMake
+  # even reports it among the "manually-specified variables ... not used").
+  # UUID_BUILD_TESTS is the switch that exists. Direct logosctl dependency,
+  # via the instance UUID the daemon generates at boot.
+  stduuid = prev.stduuid.overrideAttrs (old: {
+    cmakeFlags = (old.cmakeFlags or [ ]) ++ [ (lib.cmakeBool "UUID_BUILD_TESTS" false) ];
+  });
+
   # glib needs two independent fixes for a Windows host.
   #
   # 1. It pulls a TARGET-platform python3, which is what drags in the broken
