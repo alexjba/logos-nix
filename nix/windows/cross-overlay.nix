@@ -84,53 +84,6 @@ in
       mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Dsysprof=disabled" ];
     });
 
-  # nixpkgs' own mingw-boolean.patch is malformed at our pinned rev: it inserts
-  # a nested block *after* `#ifndef HAVE_BOOLEAN` without removing or closing
-  # that line, so every translation unit including jpeglib.h dies with
-  #     src/jmorecfg.h:202: error: unterminated #ifndef
-  # qtbase propagates libjpeg, so this stops the Qt build outright.
-  #
-  # The patch's ADDED block is already correct and self-contained (it is
-  # MSYS2's jpeg-typedefs.patch); only the now-redundant outer line is left
-  # over. Deleting it post-patch yields exactly the intended MSYS2 form, and
-  # avoids re-deriving a patch whose context whitespace we cannot verify here.
-  #
-  # Fixed upstream in NixOS/nixpkgs#476269, merged 2026-01-09 — AFTER the rev
-  # logos-nix pins. Drop this override once the pin moves past it.
-  libjpeg_turbo = prev.libjpeg_turbo.overrideAttrs (old: {
-    postPatch = (old.postPatch or "") + ''
-      if ! grep -q '^#ifndef HAVE_BOOLEAN$' src/jmorecfg.h; then
-        echo "libjpeg_turbo: expected stray '#ifndef HAVE_BOOLEAN' not found."
-        echo "The upstream patch has changed -- re-check whether this override is still needed."
-        exit 1
-      fi
-      sed -i '0,/^#ifndef HAVE_BOOLEAN$/{/^#ifndef HAVE_BOOLEAN$/d}' src/jmorecfg.h
-    '';
-  });
-
-  # pkg-config bundles an ancient glib (--with-internal-glib) whose
-  # gthread-win32.c passes an incompatible pointer to
-  # _InterlockedCompareExchangePointer. GCC 14 promoted
-  # -Wincompatible-pointer-types from a warning to an ERROR, so the bundled
-  # copy no longer compiles for a Windows host.
-  #
-  # nixpkgs already silences a sibling Windows-only diagnostic here
-  #     ++ lib.optionals stdenv.hostPlatform.isWindows [ "-Wno-error=format" ]
-  # so this is the same gap as glib's sysprof: partial Windows awareness with
-  # one case missed. Demote rather than disable, so genuine new instances in
-  # OUR code still fail.
-  pkg-config-unwrapped = prev.pkg-config-unwrapped.overrideAttrs (old: {
-    env = (old.env or { }) // {
-      NIX_CFLAGS_COMPILE =
-        (old.env.NIX_CFLAGS_COMPILE or "")
-        + " -Wno-error=incompatible-pointer-types"
-        # Same file, second GCC 14 promotion: `passing argument 2 of
-        # '_InterlockedCompareExchangePointer' makes pointer from integer
-        # without a cast [-Wint-conversion]`.
-        + " -Wno-error=int-conversion";
-    };
-  });
-
   qt6 = prev.qt6.overrideScope (
     qfinal: qprev: {
       # qtModule.nix hardcodes `platforms = platforms.unix`, but merges

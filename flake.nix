@@ -3,9 +3,33 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+    # WINDOWS TARGET ONLY. Deliberately a second, newer nixpkgs — the one
+    # exception to this repo's "never add a separate nixpkgs pin" rule, scoped
+    # so it can never reach a Linux or macOS build.
+    #
+    # Why: Qt 6.9.2 loads plugins with a bare LoadLibrary, so a module in its
+    # own directory cannot resolve a vendored DLL sitting next to it — measured
+    # on real Windows, Nix-built 6.9.2:
+    #     mode=plain  -> LOAD=FAILURE "The specified module could not be found."
+    #     mode=adddll -> LOAD=SUCCESS
+    # Qt fixed this by 6.11.1, where plain loading succeeds unaided. Taking
+    # 6.11.1 for Windows removes the need to call SetDefaultDllDirectories +
+    # AddDllDirectory before every QPluginLoader::load() across logos-module,
+    # logos-basecamp and logos-module-loader-qt.
+    #
+    # Cost: Windows ships Qt 6.11.1 while Linux/macOS stay on 6.9.2, and
+    # logos-cpp-sdk notes "the QRO wire is Qt-version-sensitive". Every process
+    # in a Logos node talks over same-machine local sockets / named pipes, so a
+    # Windows install is internally consistent; there is no cross-platform QtRO
+    # link today. Revisit if one is ever introduced.
+    #
+    # Pinned to the exact base that logos-co/nixpkgs@mingw-integration was
+    # rebased onto, so that branch stays a byte-for-byte reference.
+    nixpkgs-windows.url = "github:NixOS/nixpkgs/b5aa0fbd538984f6e3d201be0005b4463d8b09f8";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, nixpkgs-windows }:
     let
       supportedSystems = [
         "aarch64-darwin"
@@ -37,9 +61,10 @@
 
       # Package set targeting Windows, built FROM `buildSystem`.
       #
-      # This is a SEPARATE `import` of the SAME pinned nixpkgs — not a second
-      # nixpkgs pin. The overlays never reach a repo's ordinary `pkgs`, so
+      # Uses `nixpkgs-windows` (Qt 6.11.1), NOT the workspace pin — see the
+      # input comment for why. Nothing else in this flake touches it, so the
       # native Linux/macOS closures are unaffected by Windows support existing.
+      #
       # The BUILD-side overlay is only needed where wine is unavailable (see
       # native-overlay.nix). Applying it unconditionally would be actively
       # harmful: it changes the NATIVE glib's hash, which invalidates the
@@ -54,7 +79,7 @@
       mkWindowsPkgs =
         { buildSystem
         , libc ? windowsCrossSystem.libc
-        }: import nixpkgs {
+        }: import nixpkgs-windows {
           localSystem = buildSystem;
           crossSystem = windowsCrossSystem // { inherit libc; };
           overlays = nixpkgs.lib.optional (needsNativeOverlay buildSystem) windowsNativeOverlay;
