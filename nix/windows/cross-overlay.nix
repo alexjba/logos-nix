@@ -84,6 +84,22 @@ in
       mesonFlags = (old.mesonFlags or [ ]) ++ [ "-Dsysprof=disabled" ];
     });
 
+  # sqlite configures with
+  #     (if hostPlatform.isStatic then "--disable-tcl"
+  #      else "--with-tcl=${lib.getLib tcl}/lib")
+  # so any non-static host pulls TARGET-platform tcl -- and tcl has no mingw
+  # port: its build wants tclWinPort.h, which only the win/ source tree
+  # provides. `isStatic` is being used as a proxy for "tcl is unavailable",
+  # which does not generalise to cross targets.
+  #
+  # Qt uses libsqlite3 only (QT_FEATURE_system_sqlite), never the TCL bindings,
+  # so dropping them costs us nothing. Reached via qtbase -> sqlite -> tcl.
+  sqlite = prev.sqlite.overrideAttrs (old: {
+    configureFlags =
+      (builtins.filter (f: !(lib.hasPrefix "--with-tcl" f)) (old.configureFlags or [ ]))
+      ++ [ "--disable-tcl" ];
+  });
+
   qt6 = prev.qt6.overrideScope (
     qfinal: qprev: {
       # qtModule.nix hardcodes `platforms = platforms.unix`, but merges
