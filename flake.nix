@@ -210,6 +210,22 @@
               name = "qtremoteobjects points at build-platform repc";
               ok = hasFlagPrefix w.qt6.qtremoteobjects "-DQt6RemoteObjectsTools_DIR=";
             }
+            # qsb is the same shape of build-platform tool, and its absence is
+            # the WORST failure mode in this file: without it qtdeclarative
+            # still configures, installs and satisfies every find_package --
+            # it just silently ships no Qt6Quick.dll, no QtQuick qmldir and no
+            # QtQuick.Controls. The whole port linked such a Qt for weeks
+            # because the assertion below it ("required Qt modules resolve")
+            # stayed true throughout. Note nixpkgs DOES pass a flag here, but
+            # aims it at Qt6ShaderTools (the target config) rather than
+            # Qt6ShaderToolsTools (the host tools), so asserting on the prefix
+            # alone would pass against the broken value -- match the suffix.
+            {
+              name = "qtdeclarative points at build-platform qsb";
+              ok = builtins.any
+                (lib.hasSuffix "/lib/cmake/Qt6ShaderToolsTools")
+                (w.qt6.qtdeclarative.cmakeFlags or [ ]);
+            }
             # A filter that silently matches nothing is the drift mode we fear
             # most, so assert on what it must have removed.
             { name = "qtbase drops libglvnd"; ok = excludes "libglvnd"; }

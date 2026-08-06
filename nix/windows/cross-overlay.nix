@@ -218,6 +218,20 @@ in
         lib.optionals isCross [
           "-DQt6QmlTools_DIR=${final.pkgsBuildBuild.qt6.qtdeclarative}/lib/cmake/Qt6QmlTools"
           "-DQt6QuickTools_DIR=${final.pkgsBuildBuild.qt6.qtdeclarative}/lib/cmake/Qt6QuickTools"
+          # WITHOUT THIS, QT QUICK IS SILENTLY NOT BUILT AT ALL. qtdeclarative
+          # still configures, still installs, and still satisfies every
+          # find_package -- it just ships no Qt6Quick.dll, no QtQuick qmldir and
+          # no QtQuick.Controls. The only trace is one line buried in the
+          # configure summary:
+          #     Note: Qt Quick modules not built due to not finding the
+          #           qtshadertools 'qsb' tool.
+          #
+          # nixpkgs does pass a flag, but points it at Qt6ShaderTools -- the
+          # TARGET-side config. The host-tools package is Qt6ShaderToolsTools,
+          # and it exists only in the native qtshadertools (correctly: qsb has
+          # to run on the build machine). Same class as the repc / QmlTools /
+          # QuickTools flags above; qsb was simply missed.
+          "-DQt6ShaderToolsTools_DIR=${final.pkgsBuildBuild.qt6.qtshadertools}/lib/cmake/Qt6ShaderToolsTools"
         ]
       ) qprev.qtdeclarative;
     }
