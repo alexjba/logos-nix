@@ -203,6 +203,46 @@ in
           "-DQT_FEATURE_vulkan=OFF"
           "-DQT_FEATURE_libproxy=OFF"
         ];
+
+        # QTCREATORBUG-32887, fixed at the source instead of per-consumer.
+        #
+        # Qt6EntryPointMinGW32Target.cmake guards itself with a BARE
+        # include_guard(). CMake scopes that to the nearest FUNCTION scope,
+        # while the add_library(IMPORTED) beside it is DIRECTORY-scoped. So
+        # calling find_package(Qt6) from inside a function() leaves the target
+        # behind when the guard variable dies at endfunction(), and the next
+        # find_package re-enters and collides:
+        #
+        #   add_library cannot create imported target "EntryPointMinGW32"
+        #   because another target with the same name already exists.
+        #
+        # Qt maintainers confirmed include_guard(GLOBAL) is the fix; qtbase has
+        # never carried it (the file has one commit, from 2021, and is identical
+        # from 6.7 to dev), and Qt's own workaround was consumer-side in
+        # qt-creator. KDE hit it too (bug 500106). Every OTHER target file in
+        # the Qt tree guards on TARGET existence instead.
+        #
+        # Patching here fixes every consumer at once. We already worked around
+        # it once by making logos_find_qt a macro; package_manager_ui then hit
+        # it through a different find_package chain, which is the signal that
+        # per-consumer workarounds do not scale.
+        postInstall = (old.postInstall or "") + ''
+          _patched=0
+          for _f in "$dev"/lib/cmake/Qt6EntryPointPrivate/*Target.cmake \
+                    "$out"/lib/cmake/Qt6EntryPointPrivate/*Target.cmake; do
+            [ -e "$_f" ] || continue
+            if grep -q '^include_guard()' "$_f"; then
+              substituteInPlace "$_f" --replace 'include_guard()' 'include_guard(GLOBAL)'
+              _patched=$((_patched + 1))
+            fi
+          done
+          if [ "$_patched" -eq 0 ]; then
+            echo "logos-nix: QTCREATORBUG-32887 patch matched nothing --" \
+                 "either Qt fixed it upstream (drop this) or the file moved." >&2
+            exit 1
+          fi
+          echo "logos-nix: applied include_guard(GLOBAL) to $_patched Qt6EntryPoint target file(s)"
+        '';
       });
 
       # repc / qmltyperegistrar / qsb are BUILD-platform tools living in their
