@@ -95,9 +95,17 @@ runs:
             fi
             # `file` on the archive itself is not enough: it reports "current ar
             # archive" for both. Look at a member.
-            m=$(ar t "$a" 2>/dev/null | grep -m1 '\.o$' || true)
+            #
+            # `.obj`, not just `.o`: CMake sets CMAKE_CXX_OUTPUT_EXTENSION to
+            # .obj when CMAKE_SYSTEM_NAME is Windows, so a mingw-cross archive's
+            # members are `foo.cpp.obj`. Measured on logos-lidl: an earlier
+            # version of this gate matched only '\.o$', found nothing, and
+            # declared "contains no object members" on two perfectly good
+            # archives. It failed RED, which is the right direction -- but the
+            # same mistake pointed the other way is how a gate passes on nothing.
+            m=$(ar t "$a" 2>/dev/null | grep -m1 -E '\.(o|obj)$' || true)
             if [ -z "$m" ]; then
-              echo "::error::$a contains no object members"; bad=1; continue
+              echo "::error::$a contains no .o/.obj members: $(ar t "$a" 2>&1 | head -5)"; bad=1; continue
             fi
             rm -rf .arprobe && mkdir .arprobe
             ( cd .arprobe && ar x "$OLDPWD/$a" "$m" )
