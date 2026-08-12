@@ -43,7 +43,11 @@ def search_dirs(pe_path):
     dirs = [os.path.dirname(pe_path), os.path.join(root, "bin"), os.path.join(root, "lib")]
     for extra in ASSEMBLE.get(target, []):
         dirs.append(os.path.join(STAGE, extra))
-    return [d for d in dirs if os.path.isdir(d)]
+    seen, out = set(), []
+    for d in dirs:
+        if d not in seen and os.path.isdir(d):
+            seen.add(d); out.append(d)
+    return out
 
 
 def is_system(dll):

@@ -81,6 +81,16 @@ on:
         type: string
         required: false
         default: '{}'
+      extra-gates:
+        description: >
+          bash run after the standard gates, from the repo root with `stage/`
+          present and `$OBJDUMP` pointing at the mingw objdump. For invariants
+          that are genuinely specific to one repo -- the workspace's
+          single-TokenManager topology check is the only one today -- rather
+          than for anything a second repo would also want.
+        type: string
+        required: false
+        default: ''
       cold-derivation-budget:
         description: >
           Fail fast rather than start a build larger than this many derivations.
@@ -112,8 +122,6 @@ jobs:
   cross-build:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
-    outputs:
-      smoke: ${{ inputs.smoke }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -205,9 +213,16 @@ jobs:
             out=$(nix build --no-link --print-out-paths \
                     ".#packages.x86_64-windows.$t" ${{ inputs.extra-nix-args }} | head -1)
             mkdir -p "stage/$t"
-            cp -rL "$out"/. "stage/$t"/
+            # --no-preserve=mode is load-bearing, not tidiness. Store outputs
+            # are r-xr-xr-x, and a plain `cp -rL` propagates that; the
+            # subsequent `chmod -R u+w` then has to succeed on every directory
+            # before anything can touch the tree. Measured: on a filesystem
+            # where it does not, staging silently produces an EMPTY tree and
+            # `cp` still exits 0 under `set -e` because the failure is in
+            # setting permissions, not in copying. The format gate caught it --
+            # but only because it refuses to pass on zero PEs.
+            cp -rL --no-preserve=mode,ownership "$out"/. "stage/$t"/
           done < targets.txt
-          chmod -R u+w stage
           find stage -type f | wc -l
 
       - uses: logos-co/logos-nix/.github/actions/windows-gates@v1
@@ -217,6 +232,27 @@ jobs:
           min-archives: ${{ inputs.min-archives }}
           lgx-variant: ${{ inputs.lgx-variant }}
           assemble: ${{ inputs.assemble }}
+
+      - name: Repo-specific gates
+        if: inputs.extra-gates != ''
+        env:
+          EXTRA_GATES: ${{ inputs.extra-gates }}
+        run: |
+          set -euo pipefail
+          OBJDUMP=""
+          while read -r p; do
+            if [ -x "$p/bin/x86_64-w64-mingw32-objdump" ]; then
+              OBJDUMP="$p/bin/x86_64-w64-mingw32-objdump"; break
+            fi
+          done < <(nix build --no-link --print-out-paths \
+                     nixpkgs#pkgsCross.mingwW64.buildPackages.binutils)
+          [ -n "$OBJDUMP" ] || { echo "::error::no mingw objdump"; exit 1; }
+          export OBJDUMP
+          # Via env, never interpolated into shell source: a script containing a
+          # single quote would otherwise terminate the quoting and execute
+          # arbitrary fragments. (This workspace's own gate contains three.)
+          printf '%s\n' "$EXTRA_GATES" > "$RUNNER_TEMP/gates.sh"
+          bash -euo pipefail "$RUNNER_TEMP/gates.sh"
 
       - name: Record the coverage this run actually bought
         run: |
@@ -261,6 +297,8 @@ jobs:
           github-token: ${{ github.token }}
       - name: Smoke (wine)
         working-directory: stage
+        env:
+          SMOKE: ${{ inputs.smoke }}
         run: |
           set -euo pipefail
           # Fully substituted from cache.nixos.org: ~53 MiB, 0 derivations built.
@@ -275,7 +313,8 @@ jobs:
           printf '#!/bin/sh\nexec %s "$@"\n' "$WINE" > "$RUNNER_TEMP/bin/run"
           chmod +x "$RUNNER_TEMP/bin/run"
           export PATH="$RUNNER_TEMP/bin:$PATH" STAGE_ABS="Z:$PWD"
-          bash -euo pipefail -c '${{ inputs.smoke }}'
+          printf '%s\n' "$SMOKE" > "$RUNNER_TEMP/smoke.sh"
+          bash -euo pipefail "$RUNNER_TEMP/smoke.sh"
 
   native-smoke:
     needs: cross-build
@@ -290,6 +329,8 @@ jobs:
       - name: Smoke (real Windows)
         working-directory: stage
         shell: bash
+        env:
+          SMOKE: ${{ inputs.smoke }}
         run: |
           set -euo pipefail
           # This is the only place in the entire org where a Nix-built PE is
@@ -300,4 +341,5 @@ jobs:
           printf '#!/bin/sh\nexec "$@"\n' > "$RUNNER_TEMP/bin/run"
           chmod +x "$RUNNER_TEMP/bin/run"
           export PATH="$RUNNER_TEMP/bin:$PATH" STAGE_ABS="$(pwd -W)"
-          bash -euo pipefail -c '${{ inputs.smoke }}'
+          printf '%s\n' "$SMOKE" > "$RUNNER_TEMP/smoke.sh"
+          bash -euo pipefail "$RUNNER_TEMP/smoke.sh"
