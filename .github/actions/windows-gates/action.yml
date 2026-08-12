@@ -1,0 +1,175 @@
+name: Windows artifact gates
+description: >
+  Assert real properties of a staged Windows (mingw) output tree. Every gate
+  here fails on an EMPTY input set -- that is not defensive padding. Each of the
+  Windows bugs found while porting this project was a SILENT SUCCESS: an install
+  rule that copied nothing and exited 0, a package that labelled itself
+  linux-amd64, a plugin shipped without its DLLs, a load-time fallback that
+  failed soft. A gate that passes vacuously on zero artifacts reproduces exactly
+  the failure mode it exists to catch.
+
+inputs:
+  stage-dir:
+    description: Directory holding one subdirectory per built target.
+    required: false
+    default: stage
+  min-pes:
+    description: >
+      Minimum number of .exe/.dll files the tree must contain. Default 1.
+      Set to 0 only together with min-archives >= 1 (a headers+static-lib repo
+      such as logos-lidl legitimately produces no PE at all).
+    required: false
+    default: '1'
+  min-archives:
+    description: Minimum number of .a static archives that must be mingw COFF.
+    required: false
+    default: '0'
+  lgx-variant:
+    description: Assert every .lgx carries a real variants/windows-x86_64 payload.
+    required: false
+    default: 'false'
+  assemble:
+    description: >
+      JSON object mapping a staged subtree to extra directories its imports may
+      resolve from, for apps assembled out of more than one derivation. Windows
+      resolves a plugin's imports from the APPLICATION directory as well as the
+      plugin's own, so "beside it" legitimately spans targets for those trees.
+      Example: {"basecamp": ["liblogos/bin", "liblogos/lib"]}
+    required: false
+    default: '{}'
+
+runs:
+  using: composite
+  steps:
+    - name: Gate — artifacts are 64-bit PEs, and nothing native leaked in
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage-dir }}
+        MIN_PES: ${{ inputs.min-pes }}
+        MIN_ARCHIVES: ${{ inputs.min-archives }}
+      run: |
+        set -euo pipefail
+        [ -d "$STAGE" ] || { echo "::error::stage dir '$STAGE' does not exist"; exit 1; }
+        if [ "$MIN_PES" -eq 0 ] && [ "$MIN_ARCHIVES" -eq 0 ]; then
+          echo "::error::min-pes and min-archives are both 0 — this gate would pass on an empty tree"
+          exit 1
+        fi
+
+        mapfile -t pes < <(find "$STAGE" -type f \( -name '*.exe' -o -name '*.dll' \) | sort)
+        echo "PE candidates: ${#pes[@]} (floor $MIN_PES)"
+        if [ "${#pes[@]}" -lt "$MIN_PES" ]; then
+          echo "::error::only ${#pes[@]} PE files staged, expected >= $MIN_PES — a target installed nothing"
+          find "$STAGE" -type f | head -50
+          exit 1
+        fi
+
+        bad=0
+        for f in "${pes[@]}"; do
+          case "$(file -b "$f")" in
+            PE32+*x86-64*) ;;
+            *) echo "::error::not a 64-bit PE: $f — $(file -b "$f")"; bad=1 ;;
+          esac
+        done
+
+        # A silent fallback to a NATIVE build emits unsuffixed ELF binaries,
+        # which the *.exe/*.dll filter above would never even look at.
+        while read -r f; do
+          if file -b "$f" | grep -q ELF; then
+            echo "::error::native ELF binary in a Windows output: $f"; bad=1
+          fi
+        done < <(find "$STAGE" -type f ! -name '*.exe' ! -name '*.dll')
+
+        # The static-library tier. A mingw .a is an ar archive of COFF objects;
+        # a native one holds ELF objects. Without this check a repo whose whole
+        # Windows output is headers + .a (logos-lidl) has nothing asserted at all.
+        if [ "$MIN_ARCHIVES" -gt 0 ]; then
+          mapfile -t archives < <(find "$STAGE" -type f -name '*.a' | sort)
+          echo "static archives: ${#archives[@]} (floor $MIN_ARCHIVES)"
+          if [ "${#archives[@]}" -lt "$MIN_ARCHIVES" ]; then
+            echo "::error::only ${#archives[@]} archives staged, expected >= $MIN_ARCHIVES"
+            bad=1
+          fi
+          for a in "${archives[@]}"; do
+            if ! file -b "$a" | grep -qi 'archive'; then
+              echo "::error::not an ar archive: $a — $(file -b "$a")"; bad=1; continue
+            fi
+            # `file` on the archive itself is not enough: it reports "current ar
+            # archive" for both. Look at a member.
+            m=$(ar t "$a" 2>/dev/null | grep -m1 '\.o$' || true)
+            if [ -z "$m" ]; then
+              echo "::error::$a contains no object members"; bad=1; continue
+            fi
+            rm -rf .arprobe && mkdir .arprobe
+            ( cd .arprobe && ar x "$OLDPWD/$a" "$m" )
+            k=$(file -b ".arprobe/$m")
+            case "$k" in
+              *"COFF"*|*"PE32+"*|*"Intel amd64"*) ;;
+              *) echo "::error::$a member $m is not COFF/x86-64: $k"; bad=1 ;;
+            esac
+          done
+          rm -rf .arprobe
+        fi
+        [ "$bad" -eq 0 ]
+
+    - name: Gate — every PE's imports are bundled beside it
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage-dir }}
+        MIN_PES: ${{ inputs.min-pes }}
+        ASSEMBLE: ${{ inputs.assemble }}
+      run: |
+        set -euo pipefail
+        if [ "$MIN_PES" -eq 0 ]; then
+          echo "no PEs expected in this tree — import-closure gate not applicable"
+          exit 0
+        fi
+        # The cross binutils is already in the closure we just built, so this
+        # costs nothing and avoids depending on the runner image's objdump
+        # having PE targets compiled in. binutils is multi-output, so
+        # --print-out-paths emits several store paths -- pick the one with objdump.
+        OBJDUMP=""
+        while read -r p; do
+          if [ -x "$p/bin/x86_64-w64-mingw32-objdump" ]; then
+            OBJDUMP="$p/bin/x86_64-w64-mingw32-objdump"; break
+          fi
+        done < <(nix build --no-link --print-out-paths \
+                   nixpkgs#pkgsCross.mingwW64.buildPackages.binutils)
+        [ -n "$OBJDUMP" ] || { echo "::error::no mingw objdump in the binutils outputs"; exit 1; }
+        export OBJDUMP
+        "$OBJDUMP" --version > /dev/null
+        python3 "$GITHUB_ACTION_PATH/import_closure.py"
+
+    - name: Gate — the .lgx declares a Windows variant with a real payload
+      if: inputs.lgx-variant == 'true'
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage-dir }}
+      run: |
+        set -euo pipefail
+        mapfile -t lgxs < <(find "$STAGE" -name '*.lgx' -type f | sort)
+        [ "${#lgxs[@]}" -gt 0 ] || { echo "::error::lgx-variant requested but no .lgx staged"; exit 1; }
+        for lgxf in "${lgxs[@]}"; do
+          # The mislabel this catches: under a mingw cross, isDarwin and
+          # isAarch64 are both false, so the variant used to fall through to
+          # "linux-amd64" -- a Windows package claiming to be a Linux one. lgpm
+          # computes "windows-x86_64" and has no alias fallback, so the exact
+          # spelling is a contract.
+          tar tzf "$lgxf" | grep -q '^variants/windows-x86_64/' \
+            || { echo "::error::$lgxf has no variants/windows-x86_64/"; tar tzf "$lgxf"; exit 1; }
+          if tar tzf "$lgxf" | grep -qE '^variants/(linux|darwin)'; then
+            echo "::error::$lgxf carries a non-Windows variant"; tar tzf "$lgxf"; exit 1
+          fi
+          # Entry names alone are not enough: a zero-byte payload satisfies the
+          # greps above. Extract and check the payload is a real PE.
+          rm -rf .lgxout && mkdir .lgxout && tar xzf "$lgxf" -C .lgxout
+          n=0
+          while read -r p; do
+            [ -s "$p" ] || { echo "::error::empty payload: $p"; exit 1; }
+            file -b "$p" | grep -q 'PE32+.*x86-64' \
+              || { echo "::error::payload is not a 64-bit PE: $p"; exit 1; }
+            n=$((n+1))
+          done < <(find .lgxout/variants/windows-x86_64 -type f \( -name '*.dll' -o -name '*.exe' \))
+          [ "$n" -gt 0 ] || { echo "::error::$lgxf windows-x86_64 variant contains no PE"; exit 1; }
+          echo "$lgxf: verified $n payload PE(s)"
+          rm -rf .lgxout
+        done

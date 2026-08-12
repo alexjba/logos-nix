@@ -1,0 +1,62 @@
+name: Nix setup
+description: >
+  Install Nix (>= 2.26), wire up the logos-co binary cache, and optionally free
+  disk space. One copy of the preamble that is currently duplicated across 76
+  workflow files in 61 repos, in 7 different and mutually incompatible pinnings.
+
+inputs:
+  cachix-auth-token:
+    description: >
+      logos-co cachix push token. Optional: without it the cache is still used
+      READ-ONLY, which is correct for forked-PR runs where secrets are absent.
+    required: false
+    default: ''
+  github-token:
+    description: Token for nix's github.com access (avoids the 60/hour anonymous budget).
+    required: false
+    default: ''
+  free-disk-space:
+    description: Reclaim ~10 GiB before a large closure. Costs ~20 s.
+    required: false
+    default: 'false'
+  extra-conf:
+    description: Extra lines appended to nix.conf.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # Pinned deliberately, and NOT to cachix/install-nix-action@v27 -- which is
+    # what 38 of the workflows in this org use today. v27 ships Nix 2.22, and
+    # below 2.26 `--override-input` discards the overridden input's own lock and
+    # silently builds months-old dependencies while reporting green. That is the
+    # single most consequential piece of drift a shared preamble removes.
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@v22
+      with:
+        extra-conf: |
+          experimental-features = nix-command flakes
+          accept-flake-config = true
+          ${{ inputs.github-token && format('access-tokens = github.com={0}', inputs.github-token) || '' }}
+          ${{ inputs.extra-conf }}
+
+    # No `continue-on-error` here, ever. A silently failed push means every
+    # subsequent run rebuilds the whole mingw Qt stack from source -- which for
+    # the Windows target is the difference between 10 minutes and several hours.
+    - name: Setup Cachix
+      uses: cachix/cachix-action@v15
+      with:
+        name: logos-co
+        authToken: ${{ inputs.cachix-auth-token }}
+        skipPush: ${{ inputs.cachix-auth-token == '' }}
+
+    - name: Free disk space
+      if: inputs.free-disk-space == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # ubuntu-latest ships ~14 GiB free; the Windows Qt closure is ~9 GiB.
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
+        df -h /

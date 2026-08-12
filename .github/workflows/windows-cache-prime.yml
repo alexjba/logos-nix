@@ -1,0 +1,119 @@
+name: Windows cache prime
+
+# Fills logos-co.cachix.org with the shared mingw closure that every Windows CI
+# job depends on. THIS IS A PREREQUISITE, NOT AN OPTIMISATION.
+#
+# THE MEASUREMENT THAT MAKES IT ONE
+#   The mingw *toolchain* substitutes from cache.nixos.org (200 on
+#   x86_64-w64-mingw32-gcc-wrapper-15.2.0). The mingw *Qt* stack does not, in
+#   either cache: qtbase, qtdeclarative, qtsvg and qtremoteobjects at 6.11.1,
+#   plus icu4c 76.1 and boost 1.89.0, were all probed 404 on BOTH
+#   logos-co.cachix.org and cache.nixos.org. nixpkgs' Hydra does not build cross
+#   Qt, so nobody upstream will ever fill it for us.
+#
+#   Consequence: without priming, EVERY Windows job in EVERY repo builds that
+#   stack from source, concurrently, and none of them can help each other
+#   because nothing lands in the cache until a job finishes. 18 eligible repos
+#   x hours each, on the first push. That is the failure mode this workflow
+#   exists to prevent, and it is why windows-ci.yml refuses to start a build
+#   over its derivation budget instead of trying.
+#
+# WHY IT IS STAGED RATHER THAN A FLAT MATRIX
+#   Parallel legs do not share a store. A flat matrix over the six packages
+#   would have five legs rebuild qtbase. Stage 1 builds and pushes the base;
+#   stages 2 and 3 then substitute it. Each stage gets its own 6 h budget, which
+#   is the only way this fits inside GitHub's per-job ceiling at all.
+#
+# IF STAGE 1 STILL DOES NOT FIT
+#   qtbase alone has never been built to completion in this project -- the one
+#   attempt ran ~6.5 h under emulation and had not started it. If stage 1 times
+#   out, CI cannot prime this cache and a human must seed it once from a real
+#   x86_64-linux machine:
+#       nix build github:logos-co/logos-nix#legacyPackages.x86_64-linux.pkgsWindows.qt6.qtbase
+#       nix path-info -r ./result | cachix push logos-co
+#   after which this workflow keeps it warm and the manual step never recurs.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, to re-fill after cachix GC and after a nixpkgs-windows bump.
+    - cron: '0 3 * * 1'
+  push:
+    branches: [master]
+    paths:
+      - 'flake.lock'
+      - 'nix/windows/**'
+
+concurrency:
+  group: windows-cache-prime
+  cancel-in-progress: false
+
+jobs:
+  base:
+    name: 'stage 1: icu4c, boost, qtbase'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/nix-setup
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          github-token: ${{ github.token }}
+          free-disk-space: 'true'
+      - run: |
+          set -euo pipefail
+          W=.#legacyPackages.x86_64-linux.pkgsWindows
+          nix build -L "$W.icu" "$W.boost" "$W.qt6.qtbase" --no-link
+
+  qt-modules:
+    name: 'stage 2: the rest of Qt'
+    needs: base
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/nix-setup
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          github-token: ${{ github.token }}
+          free-disk-space: 'true'
+      - run: |
+          set -euo pipefail
+          W=.#legacyPackages.x86_64-linux.pkgsWindows
+          nix build -L "$W.qt6.qtdeclarative" "$W.qt6.qtsvg" \
+                       "$W.qt6.qtremoteobjects" --no-link
+
+  apps:
+    name: 'stage 3: the deepest Logos closures'
+    needs: qt-modules
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/nix-setup
+        with:
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          github-token: ${{ github.token }}
+          free-disk-space: 'true'
+      - name: Build the two closures that between them cover everything else
+        run: |
+          set -euo pipefail
+          # Measured with `nix build --dry-run`: logoscore-cli's `cli` is 100
+          # derivations / 684 paths / 999 MiB and liblogos' `portable` is 95 —
+          # the union is a superset of what every other Windows target needs.
+          # Building these two primes the whole fleet.
+          nix build -L --no-link \
+            'github:logos-co/logos-logoscore-cli#packages.x86_64-windows.cli' \
+            'github:logos-co/logos-liblogos#packages.x86_64-windows.portable'
+      - name: Report what is now cached
+        run: |
+          set -euo pipefail
+          {
+            echo "### Windows cache primed"
+            for a in 'github:logos-co/logos-logoscore-cli#packages.x86_64-windows.cli'; do
+              p=$(nix eval --raw "$a.outPath")
+              h=$(basename "$p" | cut -d- -f1)
+              code=$(curl -s -o /dev/null -w '%{http_code}' "https://logos-co.cachix.org/$h.narinfo")
+              echo "- \`$a\` → HTTP $code"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

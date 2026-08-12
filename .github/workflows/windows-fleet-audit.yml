@@ -1,0 +1,80 @@
+name: Windows fleet audit
+
+# The drift detector. Fleet-wide Windows CI has exactly two ways to rot, and
+# neither shows up as a red build anywhere:
+#
+#   (1) A repo GAINS an x86_64-windows target and nobody adds the caller. This
+#       is the common case, because for the ~21 pass-through module repos the
+#       whole Windows port is a logos-module-builder bump -- measured: with
+#       logos-module-builder overridden to master, logos-accounting-module goes
+#       from "attribute missing" to 17 Windows attributes with ZERO source
+#       change. A routine dependency bump silently creates an untested Windows
+#       artifact.
+#
+#   (2) A repo LOSES its target (a flake refactor that rebuilds `packages` over
+#       a hardcoded `systems` list overwrites the builder's Windows attrs) while
+#       keeping the caller. windows-ci.yml turns that into a loud red on the
+#       repo itself, so this job only has to catch (1).
+#
+# It also names the repos that have Linux+macOS CI and no Windows story at all,
+# so "we did not cover it" stays a decision on a list rather than an omission.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 5 * * 2'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/nix-setup
+        with:
+          github-token: ${{ github.token }}
+      - name: Audit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          gh api --paginate 'orgs/logos-co/repos?per_page=100' \
+            --jq '.[] | select(.archived==false) | .name' | sort > repos.txt
+          echo "candidate repos: $(wc -l < repos.txt)"
+
+          : > covered.txt; : > drift.txt; : > noneed.txt; : > broken.txt
+          while read -r r; do
+            # Cheap pre-filter: no flake, nothing to evaluate.
+            gh api "repos/logos-co/$r/contents/flake.nix" >/dev/null 2>&1 || continue
+            if attrs=$(timeout 180 nix eval --raw "github:logos-co/$r#packages.x86_64-windows" \
+                         --apply 'x: builtins.concatStringsSep "," (builtins.attrNames x)' 2>/dev/null); then
+              if gh api "repos/logos-co/$r/contents/.github/workflows/windows.yml" >/dev/null 2>&1; then
+                echo "$r ($attrs)" >> covered.txt
+              else
+                echo "$r ($attrs)" >> drift.txt
+              fi
+            else
+              # Does it at least have Linux+macOS CI? Then it is a real gap,
+              # not merely an irrelevant repo.
+              if gh api "repos/logos-co/$r/contents/.github/workflows" --jq '.[].name' 2>/dev/null \
+                   | grep -q .; then
+                echo "$r" >> noneed.txt
+              fi
+            fi
+          done < repos.txt
+
+          {
+            echo "### Windows CI fleet audit"
+            echo "| bucket | count |"; echo "|---|---|"
+            echo "| covered (target + caller) | $(wc -l < covered.txt) |"
+            echo "| **DRIFT (target, no caller)** | $(wc -l < drift.txt) |"
+            echo "| no Windows target | $(wc -l < noneed.txt) |"
+            echo; echo "#### Covered"; sed 's/^/- /' covered.txt
+            echo; echo "#### Drift — these produce untested Windows artifacts"; sed 's/^/- /' drift.txt
+            echo; echo "#### No Windows target (out of scope until ported)"; sed 's/^/- /' noneed.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -s drift.txt ]; then
+            while read -r l; do echo "::error::$l exposes packages.x86_64-windows but has no .github/workflows/windows.yml"; done < drift.txt
+            exit 1
+          fi

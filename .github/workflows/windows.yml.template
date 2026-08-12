@@ -1,0 +1,46 @@
+# Copy to <repo>/.github/workflows/windows.yml and edit the two `with:` lines.
+# This is the ENTIRE per-repo cost of Windows CI. Everything else -- the Nix
+# install pinning, the binary cache, the disk reclaim, the target-existence
+# guard, the cold-cache refusal, the PE-format gate, the import-closure gate,
+# the artifact hand-off, the wine pre-filter and the real-Windows execution --
+# lives once in logos-co/logos-nix.
+#
+# DO NOT add this file to a repo with no `packages.x86_64-windows`. The job will
+# fail loudly by design rather than pass by having nothing to do. Check with:
+#   nix eval github:logos-co/<repo>#packages.x86_64-windows --apply builtins.attrNames
+# If that errors and the repo is a logos-module-builder consumer that does not
+# rebuild `packages` over its own hardcoded `systems` list, the port is a
+# module-builder bump and nothing else.
+
+name: Windows
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  windows:
+    uses: logos-co/logos-nix/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      # Attribute names under packages.x86_64-windows. Whitespace-separated.
+      targets: default
+      # bash, run from the staged tree root, on BOTH wine and a real Windows
+      # runner. `run` is a wrapper that is `wine` on Linux and nothing on
+      # Windows. Leave EMPTY only if this repo produces no executable -- the run
+      # is then reported as compile-only, which is a coverage gap, not a pass.
+      smoke: |
+        run bin/YOUR_TOOL.exe --version
+
+      # ---- the knobs you will rarely touch --------------------------------
+      # min-pes: 1            floor on staged .exe/.dll; a headers+static-lib
+      #                       repo sets `min-pes: 0` AND `min-archives: 1`
+      # lgx-variant: false    set true if this repo emits a .lgx
+      # native-smoke: true    run on a real windows-latest runner (free, ~2 min)
+      # wine-smoke: true      run under wine first, for a faster red
+      # cold-derivation-budget: 30
+      #                       refuse to start an unprimed mingw Qt build
+      # assemble: '{}'        widen the import search path for a multi-
+      #                       derivation app, e.g. '{"basecamp":["liblogos/bin"]}'
