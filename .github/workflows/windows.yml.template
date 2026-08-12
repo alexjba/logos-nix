@@ -2,8 +2,8 @@
 # This is the ENTIRE per-repo cost of Windows CI. Everything else -- the Nix
 # install pinning, the binary cache, the disk reclaim, the target-existence
 # guard, the cold-cache refusal, the PE-format gate, the import-closure gate,
-# the artifact hand-off, the wine pre-filter and the real-Windows execution --
-# lives once in logos-co/logos-nix.
+# the artifact hand-off and its round-trip check, the wine pre-filter and the
+# real-Windows execution -- lives once in logos-co/logos-nix.
 #
 # DO NOT add this file to a repo with no `packages.x86_64-windows`. The job will
 # fail loudly by design rather than pass by having nothing to do. Check with:
@@ -27,12 +27,26 @@ jobs:
     with:
       # Attribute names under packages.x86_64-windows. Whitespace-separated.
       targets: default
-      # bash, run from the staged tree root, on BOTH wine and a real Windows
-      # runner. `run` is a wrapper that is `wine` on Linux and nothing on
-      # Windows. Leave EMPTY only if this repo produces no executable -- the run
-      # is then reported as compile-only, which is a coverage gap, not a pass.
+
+      # bash, run on BOTH wine and a real Windows runner, from the staged tree
+      # ROOT. The root holds ONE DIRECTORY PER TARGET, so every path begins with
+      # the target name. This is the mistake to not make:
+      #
+      #     run default/bin/YOUR_TOOL.exe --version     <- correct
+      #     run bin/YOUR_TOOL.exe --version             <- `stage/bin` does not exist
+      #
+      # `run` is a wrapper on PATH: wine on Linux, a direct exec on Windows, so
+      # one script serves both legs. It also refuses three silent outcomes --
+      # a path that does not exist, a 0xC0000135 launch failure (which prints
+      # NOTHING, on either leg), and a command that exits 0 having produced no
+      # output at all. For a command that is legitimately silent, use `run -q`.
+      #
+      # `$STAGE_ABS` is the tree root as the PE sees it (a Z: path under wine).
+      #
+      # Leave EMPTY only if this repo produces no executable -- the run is then
+      # reported as compile-only, which is a coverage gap, not a pass.
       smoke: |
-        run bin/YOUR_TOOL.exe --version
+        run default/bin/YOUR_TOOL.exe --version
 
       # ---- the knobs you will rarely touch --------------------------------
       # min-pes: 1            floor on staged .exe/.dll; a headers+static-lib
