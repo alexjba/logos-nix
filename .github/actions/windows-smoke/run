@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# `run` -- the one launcher both smoke legs use.
+#
+# WHY THIS IS NOT JUST `exec "$@"`
+#   All three ways a staged Windows binary fails to start are SILENT, and two of
+#   them are indistinguishable from each other by exit code alone. Measured on a
+#   real Windows 11 (26200) box and on wine 11.0, against logos-package's staged
+#   lgx.exe with exactly one DLL removed from an otherwise-working tree:
+#
+#   launcher                intact     missing DLL                      missing path
+#   ----------------------  ---------  -------------------------------  -----------------
+#   Windows, non-bash       rc=0       rc=-1073741515 (0xC0000135),     n/a
+#     parent (PowerShell)              stdout AND stderr both EMPTY
+#   Windows, Git-Bash/MSYS  rc=0       rc=127, stdout empty, stderr     rc=127, "No such
+#     parent (the CI leg)              names an ARBITRARY dependency    file or directory"
+#                                      -- libgcc_s_seh-1.dll every
+#                                      time, whichever DLL was
+#                                      actually removed
+#   wine on Linux           rc=0       rc=53 (0xC0000135 & 0xFF),       rc=53 + "wine:
+#                                      stdout AND stderr both EMPTY     failed to open"
+#
+#   So under bash, 127 means EITHER "the path is wrong" OR "a DLL is missing",
+#   and under wine 53 means either and prints nothing at all. The pre-flight
+#   existence check separates the two; the exit-code case names the other one.
+#
+# CONTRACT
+#   Paths are relative to the staged tree ROOT, which holds one directory per
+#   target: `run lgx/bin/lgx.exe --help`, never `run bin/lgx.exe --help`.
+#   $RUN_EXEC, if set, is prepended (the wine binary). `run -q CMD` permits a
+#   command that legitimately produces no output.
+set -uo pipefail
+
+RUN_ALLOW_SILENT="${RUN_ALLOW_SILENT:-}"
+if [ "${1:-}" = "-q" ]; then RUN_ALLOW_SILENT=1; shift; fi
+
+pe="${1:-}"
+[ -n "$pe" ] || { echo "::error::run: no program given"; exit 1; }
+
+if [ ! -f "$pe" ]; then
+  echo "::error::run: '$pe' does not exist (cwd: $(pwd))."
+  echo "::error::Smoke paths are relative to the staged tree ROOT, and the root holds"
+  echo "::error::one directory PER TARGET -- so a path starts with the target name:"
+  echo "::error::    run lgx/bin/lgx.exe --help      not    run bin/lgx.exe --help"
+  echo "::error::staged targets here: $(find . -mindepth 1 -maxdepth 1 -type d \
+                                          | sed 's|^\./||' | sort | tr '\n' ' ')"
+  exit 1
+fi
+
+# Captured rather than streamed: the EMPTINESS of stdout is itself the signal
+# for two of the failure modes above. These are short-lived CLIs, so paying for
+# that with a loss of interleaving is the right trade.
+o=$(mktemp); e=$(mktemp)
+if [ -n "${RUN_EXEC:-}" ]; then
+  "$RUN_EXEC" "$@" >"$o" 2>"$e"
+else
+  "$@" >"$o" 2>"$e"
+fi
+rc=$?
+cat "$o"; cat "$e" >&2
+osz=$(wc -c < "$o"); esz=$(wc -c < "$e")
+rm -f "$o" "$e"
+
+case "$rc" in
+  53|127|3221225781|-1073741515)
+    if [ "$osz" -eq 0 ]; then
+      echo "::error::$pe exited $rc having printed nothing on stdout."
+      echo "::error::That is STATUS_DLL_NOT_FOUND (0xC0000135): the loader could not find a"
+      echo "::error::dependency, so the process died before main() and never got to say so."
+      echo "::error::Do not read the exit code as the whole story -- from a Git-Bash parent"
+      echo "::error::the accompanying 'error while loading shared libraries' line names an"
+      echo "::error::ARBITRARY dependency, not the missing one (measured)."
+      echo "::error::The import-closure gate should have caught this on the builder; if it"
+      echo "::error::did not, either the artifact lost a file in transit or the DLL is"
+      echo "::error::loaded at RUNTIME (LoadLibrary), which no import table records."
+      echo "::error::Shipped beside it:"
+      # shellcheck disable=SC2012  # these are DLL names, not arbitrary input
+      ls -1 "$(dirname "$pe")" | sed 's/^/::error::  /'
+      exit 1
+    fi ;;
+esac
+
+if [ "$rc" -eq 0 ] && [ "$osz" -eq 0 ] && [ "$esz" -eq 0 ] && [ -z "$RUN_ALLOW_SILENT" ]; then
+  echo "::error::$pe exited 0 and printed nothing at all."
+  echo "::error::Silent success is this project's dominant defect class -- an install rule"
+  echo "::error::that copied nothing, a package that labelled itself linux-amd64, a plugin"
+  echo "::error::shipped without its DLLs, a reply never sent. Every one of them exited 0."
+  echo "::error::A smoke test that cannot tell 'it worked' from 'it did nothing' is not"
+  echo "::error::coverage."
+  echo "::error::If this command is legitimately silent, invoke it as: run -q $pe ..."
+  exit 1
+fi
+
+exit "$rc"

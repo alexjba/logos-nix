@@ -27,6 +27,16 @@ name: Windows (cross)
 #   than time out after four hours in a way nobody can read. Prime the cache
 #   once, from logos-nix's windows-cache-prime.yml, before enabling any
 #   Qt-dependent caller.
+#
+# CALLER STRINGS ARE DATA, NEVER SHELL SOURCE
+#   Every `inputs.*` that reaches a shell does so through `env:`. GitHub
+#   substitutes `${{ }}` into the script TEXT before bash ever sees it, so a
+#   caller value containing a quote breaks the surrounding command and a caller
+#   value containing $(...) executes on this runner. actionlint does not catch
+#   it -- it replaces `${{ }}` with a placeholder before handing the script to
+#   shellcheck, which is exactly why an earlier revision of this file linted
+#   clean while `[ -z "${{ inputs.smoke }}" ]` turned a green build red on the
+#   first caller whose smoke script contained a double quote.
 
 on:
   workflow_call:
@@ -42,12 +52,15 @@ on:
       smoke:
         description: >
           bash script run against the staged tree, on BOTH wine and a real
-          windows-latest runner, from the tree root. Invoke PEs through the
-          `run` wrapper on PATH -- it is `exec wine "$@"` on Linux and
-          `exec "$@"` on Windows, so ONE script serves both legs. `$STAGE_ABS`
-          is the tree root spelled the way the PE will see it (a `Z:` path under
-          wine, a drive path on Windows). Empty means COMPILE-ONLY -- allowed,
-          but reported as a coverage gap, not as a pass.
+          windows-latest runner, from the tree ROOT. The tree root holds one
+          directory per target, so every path starts with a target name:
+          `run lgx/bin/lgx.exe --help`, NOT `run bin/lgx.exe --help`.
+          Invoke PEs through the `run` wrapper on PATH -- it is wine on Linux
+          and a direct exec on Windows, so ONE script serves both legs, and it
+          turns the three silent Windows launch failures into named errors.
+          `$STAGE_ABS` is the tree root spelled the way the PE will see it (a
+          `Z:` path under wine, a drive path on Windows). Empty means
+          COMPILE-ONLY -- allowed, but reported as a coverage gap, not a pass.
         type: string
         required: false
         default: ''
@@ -141,14 +154,18 @@ jobs:
       # ------------------------------------------------------------------
       - name: Resolve targets (fails loudly if the repo has no Windows output)
         id: targets
+        env:
+          TARGETS_IN: ${{ inputs.targets }}
+          EXTRA_NIX_ARGS: ${{ inputs.extra-nix-args }}
         run: |
           set -euo pipefail
-          read -r -a TARGETS <<< "${{ inputs.targets }}"
+          read -r -a TARGETS <<< "$TARGETS_IN"
+          read -r -a NIXARGS <<< "$EXTRA_NIX_ARGS"
           if [ "${#TARGETS[@]}" -eq 0 ]; then
             echo "::error::no targets given"; exit 1
           fi
           if ! nix eval --raw '.#packages.x86_64-windows' --apply 'x: "ok"' \
-                ${{ inputs.extra-nix-args }} >/dev/null 2>err.log; then
+                "${NIXARGS[@]}" >/dev/null 2>err.log; then
             echo "::error::this repo exposes no packages.x86_64-windows."
             echo "::error::Do not add this workflow to a repo without a Windows target."
             echo "::error::For a module repo, the port is usually a logos-module-builder bump — nothing else."
@@ -157,7 +174,7 @@ jobs:
           fi
           have=$(nix eval --raw '.#packages.x86_64-windows' \
                    --apply 'x: builtins.concatStringsSep " " (builtins.attrNames x)' \
-                   ${{ inputs.extra-nix-args }})
+                   "${NIXARGS[@]}")
           echo "repo exposes: $have"
           ATTRS=()
           for t in "${TARGETS[@]}"; do
@@ -176,17 +193,23 @@ jobs:
       # sixty-second failure that says what to do. See the header.
       # ------------------------------------------------------------------
       - name: Check the cache is primed
+        env:
+          EXTRA_NIX_ARGS: ${{ inputs.extra-nix-args }}
+          BUDGET: ${{ inputs.cold-derivation-budget }}
         run: |
           set -euo pipefail
           mapfile -t ATTRS < attrs.txt
-          nix build --dry-run "${ATTRS[@]}" ${{ inputs.extra-nix-args }} \
+          read -r -a NIXARGS <<< "$EXTRA_NIX_ARGS"
+          nix build --dry-run "${ATTRS[@]}" "${NIXARGS[@]}" \
             2> dry.log || { cat dry.log; exit 1; }
           # `nix build --dry-run` writes its plan to stderr as
-          # "these N derivations will be built:" followed by one path per line.
+          # "this derivation will be built:" / "these N derivations will be
+          # built:" followed by one indented path per line. Both spellings are
+          # matched; verified against a real plan from nix 2.34.6.
           n=$(awk '/will be built/{f=1;next} /will be fetched|^$/{f=0} f&&/^ /{c++} END{print c+0}' dry.log)
-          echo "derivations to build: $n (budget ${{ inputs.cold-derivation-budget }})"
+          echo "derivations to build: $n (budget $BUDGET)"
           sed -n '1,40p' dry.log
-          if [ "$n" -gt "${{ inputs.cold-derivation-budget }}" ]; then
+          if [ "$n" -gt "$BUDGET" ]; then
             echo "::error::$n derivations to build exceeds the budget."
             echo "::error::This is what an unprimed mingw Qt closure looks like. Building it here"
             echo "::error::would take hours and probably hit GitHub's 6 h ceiling."
@@ -196,22 +219,28 @@ jobs:
           fi
 
       - name: Cross-build
+        env:
+          EXTRA_NIX_ARGS: ${{ inputs.extra-nix-args }}
         run: |
           set -euo pipefail
           mapfile -t ATTRS < attrs.txt
+          read -r -a NIXARGS <<< "$EXTRA_NIX_ARGS"
           # One invocation so nix parallelises the shared closure rather than
           # serialising near-identical dependency graphs.
-          nix build "${ATTRS[@]}" ${{ inputs.extra-nix-args }} \
+          nix build "${ATTRS[@]}" "${NIXARGS[@]}" \
             --print-build-logs --no-link
 
       - name: Stage
+        env:
+          EXTRA_NIX_ARGS: ${{ inputs.extra-nix-args }}
         run: |
           set -euo pipefail
+          read -r -a NIXARGS <<< "$EXTRA_NIX_ARGS"
           mkdir -p stage
           while read -r t; do
             [ -n "$t" ] || continue
             out=$(nix build --no-link --print-out-paths \
-                    ".#packages.x86_64-windows.$t" ${{ inputs.extra-nix-args }} | head -1)
+                    ".#packages.x86_64-windows.$t" "${NIXARGS[@]}" | head -1)
             mkdir -p "stage/$t"
             # --no-preserve=mode is load-bearing, not tidiness. Store outputs
             # are r-xr-xr-x, and a plain `cp -rL` propagates that; the
@@ -223,6 +252,11 @@ jobs:
             # but only because it refuses to pass on zero PEs.
             cp -rL --no-preserve=mode,ownership "$out"/. "stage/$t"/
           done < targets.txt
+          # ONE DIRECTORY PER TARGET, and nothing at the root. This is the
+          # contract the smoke script's paths are written against; `stage/bin`
+          # does not exist even for a single-target repo. Verified against a
+          # real staged tree: `stage/` holds only `lgx/`.
+          echo "staged tree root:"; ls -1 stage
           find stage -type f | wc -l
 
       - uses: logos-co/logos-nix/.github/actions/windows-gates@v1
@@ -254,20 +288,44 @@ jobs:
           printf '%s\n' "$EXTRA_GATES" > "$RUNNER_TEMP/gates.sh"
           bash -euo pipefail "$RUNNER_TEMP/gates.sh"
 
-      - name: Record the coverage this run actually bought
+      # ------------------------------------------------------------------
+      # The upload/download hop is the one link in this chain nobody has ever
+      # observed. Record the PE set here and re-count it on the far side, so
+      # "the artifact arrived intact" is asserted rather than assumed.
+      #
+      # NOT dot-prefixed: upload-artifact v4 EXCLUDES hidden files unless
+      # include-hidden-files is set, so a `.pe-manifest.txt` would be dropped
+      # silently -- the exact failure class this file exists to detect.
+      # ------------------------------------------------------------------
+      - name: Record the PE manifest for the round-trip check
+        working-directory: stage
         run: |
+          set -euo pipefail
+          find . -type f \( -name '*.exe' -o -name '*.dll' \) \
+            | sed 's|^\./||' | LC_ALL=C sort > pe-manifest.txt
+          echo "recorded $(wc -l < pe-manifest.txt) PEs"
+          cat pe-manifest.txt
+
+      - name: Record the coverage this run actually bought
+        env:
+          SMOKE: ${{ inputs.smoke }}
+          TARGETS_IN: ${{ inputs.targets }}
+          WINE_SMOKE: ${{ inputs.wine-smoke }}
+          NATIVE_SMOKE: ${{ inputs.native-smoke }}
+        run: |
+          set -euo pipefail
           {
             echo "### Windows (cross)"
-            echo "- targets: \`${{ inputs.targets }}\`"
-            echo "- staged PEs: $(find stage -name '*.exe' -o -name '*.dll' | wc -l)"
-            if [ -z "${{ inputs.smoke }}" ]; then
+            echo "- targets: \`$TARGETS_IN\`"
+            echo "- staged PEs: $(wc -l < stage/pe-manifest.txt)"
+            if [ -z "$SMOKE" ]; then
               echo "- runtime coverage: **NONE — compile-and-inspect only.**"
               echo "  Nothing in this repo was executed on Windows. Add a \`smoke:\` script."
             else
-              echo "- runtime coverage: wine=${{ inputs.wine-smoke }} native=${{ inputs.native-smoke }}"
+              echo "- runtime coverage: wine=$WINE_SMOKE native=$NATIVE_SMOKE"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ -z "${{ inputs.smoke }}" ]; then
+          if [ -z "$SMOKE" ]; then
             echo "::warning::compile-only: no Windows binary from this repo was executed."
           fi
 
@@ -281,6 +339,18 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # --------------------------------------------------------------------------
+  # THE TWO SMOKE LEGS
+  #
+  # Separate jobs rather than one matrix, on purpose: a matrix leg emptied out
+  # by a step-level `if` still reports green, and a green job that did nothing
+  # is the exact failure mode this whole design exists to avoid. A disabled leg
+  # here does not appear in the run at all.
+  #
+  # Both call the SAME action with the SAME inputs but one -- `wine`. That is
+  # what makes a disagreement between them evidence of a real wine-vs-Windows
+  # divergence rather than of two harnesses that drifted apart.
+  # --------------------------------------------------------------------------
   wine-smoke:
     needs: cross-build
     if: inputs.smoke != '' && inputs.wine-smoke
@@ -295,26 +365,11 @@ jobs:
         with:
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           github-token: ${{ github.token }}
-      - name: Smoke (wine)
-        working-directory: stage
-        env:
-          SMOKE: ${{ inputs.smoke }}
-        run: |
-          set -euo pipefail
-          # Fully substituted from cache.nixos.org: ~53 MiB, 0 derivations built.
-          WINE=$(nix build --no-link --print-out-paths nixpkgs#wine64Packages.minimal)/bin/wine
-          export WINEPREFIX="$RUNNER_TEMP/wineprefix" WINEDEBUG=-all
-          export WINEDLLOVERRIDES="mscoree,mshtml="
-          unset DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
-          # upload-artifact does not preserve the executable bit.
-          chmod -R u+rwX .
-          # The `run` wrapper is what lets one smoke script serve both legs.
-          mkdir -p "$RUNNER_TEMP/bin"
-          printf '#!/bin/sh\nexec %s "$@"\n' "$WINE" > "$RUNNER_TEMP/bin/run"
-          chmod +x "$RUNNER_TEMP/bin/run"
-          export PATH="$RUNNER_TEMP/bin:$PATH" STAGE_ABS="Z:$PWD"
-          printf '%s\n' "$SMOKE" > "$RUNNER_TEMP/smoke.sh"
-          bash -euo pipefail "$RUNNER_TEMP/smoke.sh"
+      - uses: logos-co/logos-nix/.github/actions/windows-smoke@v1
+        with:
+          stage-dir: stage
+          smoke: ${{ inputs.smoke }}
+          wine: 'true'
 
   native-smoke:
     needs: cross-build
@@ -322,24 +377,19 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
+      # The only place in the entire org where a Nix-built PE is executed by
+      # Windows. Nothing is installed on the runner: the import-closure gate in
+      # cross-build already proved every non-system DLL ships inside the tree.
+      # Pre-validated by hand before this file was written -- logos-package's
+      # cross-built lgx.exe plus its seven DLLs, unpacked from a zip onto a
+      # Windows 11 box with no toolchain and no runtime present, ran and printed
+      # 988 bytes of help.
       - uses: actions/download-artifact@v4
         with:
           name: windows-x86_64-${{ github.event.repository.name }}
           path: stage
-      - name: Smoke (real Windows)
-        working-directory: stage
-        shell: bash
-        env:
-          SMOKE: ${{ inputs.smoke }}
-        run: |
-          set -euo pipefail
-          # This is the only place in the entire org where a Nix-built PE is
-          # executed by Windows. Nothing is installed: the import-closure gate
-          # in cross-build already proved every non-system DLL ships in the tree,
-          # so a stock windows-latest image is sufficient.
-          mkdir -p "$RUNNER_TEMP/bin"
-          printf '#!/bin/sh\nexec "$@"\n' > "$RUNNER_TEMP/bin/run"
-          chmod +x "$RUNNER_TEMP/bin/run"
-          export PATH="$RUNNER_TEMP/bin:$PATH" STAGE_ABS="$(pwd -W)"
-          printf '%s\n' "$SMOKE" > "$RUNNER_TEMP/smoke.sh"
-          bash -euo pipefail "$RUNNER_TEMP/smoke.sh"
+      - uses: logos-co/logos-nix/.github/actions/windows-smoke@v1
+        with:
+          stage-dir: stage
+          smoke: ${{ inputs.smoke }}
+          wine: 'false'

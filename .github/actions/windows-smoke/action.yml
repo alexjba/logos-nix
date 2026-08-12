@@ -1,0 +1,107 @@
+name: Windows smoke
+description: >
+  Run a caller's smoke script against a staged Windows tree -- byte-identically
+  on wine (ubuntu-latest) and on a real windows-latest runner. It lives in an
+  action rather than twice in windows-ci.yml for two reasons. The legs are only
+  comparable if they run the SAME harness, and a harness duplicated in two YAML
+  blocks stays identical only by discipline. And a script embedded in YAML is
+  invisible to shellcheck: actionlint substitutes a placeholder for `${{ }}`
+  before linting, which is precisely how `[ -z "${{ inputs.smoke }}" ]` shipped
+  in an earlier revision of this design and lint-cleanly turned a good build red
+  on the first caller whose smoke script contained a double quote.
+
+inputs:
+  smoke:
+    description: >
+      bash script, run from the staged tree ROOT. The root holds one directory
+      per target, so every path begins with the target name --
+      `run lgx/bin/lgx.exe --help`, not `run bin/lgx.exe --help`.
+    required: true
+  stage-dir:
+    description: Directory the artifact was downloaded into.
+    required: false
+    default: stage
+  wine:
+    description: >
+      'true' to launch every PE through wine (the Linux pre-filter leg), 'false'
+      to exec it directly (the real-Windows leg). This is the ONLY difference
+      between the two legs.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # ----------------------------------------------------------------------
+    # The upload/download hop is the one link in this chain nobody has ever
+    # observed end to end. Assert it instead of assuming it: the builder wrote
+    # pe-manifest.txt next to the tree, so re-count here and diff.
+    # ----------------------------------------------------------------------
+    - name: Verify the artifact survived the round trip
+      shell: bash
+      working-directory: ${{ inputs.stage-dir }}
+      run: |
+        set -euo pipefail
+        if [ ! -f pe-manifest.txt ]; then
+          echo "::error::pe-manifest.txt is missing from the downloaded artifact."
+          echo "::error::The builder writes it into the tree root immediately before upload."
+          echo "::error::If it is absent, the artifact is not the one this workflow produced"
+          echo "::error::-- or upload-artifact dropped it (it excludes hidden files, which is"
+          echo "::error::why this file is NOT dot-prefixed)."
+          find . -type f | head -50
+          exit 1
+        fi
+        find . -type f \( -name '*.exe' -o -name '*.dll' \) \
+          | sed 's|^\./||' | LC_ALL=C sort > arrived.txt
+        # Compared in the shell, NOT with diff. `diff` is absent from some
+        # Windows bash installs, and `if ! diff a b` cannot tell "the files
+        # differ" from "diff is not installed" -- it reports a missing tool as a
+        # corrupted artifact. Measured: this check failed exactly that way on a
+        # Windows box whose artifact was in fact byte-perfect.
+        if [ "$(cat pe-manifest.txt)" != "$(cat arrived.txt)" ]; then
+          echo "::error::the PE set changed between upload and download."
+          echo "::error::A PE that vanishes here reappears later as a silent load failure."
+          grep -Fxv -f arrived.txt pe-manifest.txt \
+            | sed 's/^/::error::  LOST in transit: /' || true
+          grep -Fxv -f pe-manifest.txt arrived.txt \
+            | sed 's/^/::error::  APPEARED from nowhere: /' || true
+          exit 1
+        fi
+        echo "artifact round trip verified: $(wc -l < pe-manifest.txt) PEs"
+        rm -f arrived.txt
+
+    - name: Smoke
+      shell: bash
+      working-directory: ${{ inputs.stage-dir }}
+      env:
+        # Via env, never interpolated into the script text. See the description.
+        SMOKE: ${{ inputs.smoke }}
+        WINE: ${{ inputs.wine }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/bin"
+        cp "$GITHUB_ACTION_PATH/run" "$RUNNER_TEMP/bin/run"
+        chmod +x "$RUNNER_TEMP/bin/run"
+        export PATH="$RUNNER_TEMP/bin:$PATH"
+
+        if [ "$WINE" = 'true' ]; then
+          # Fully substituted from cache.nixos.org: ~53 MiB, 0 derivations built.
+          RUN_EXEC=$(nix build --no-link --print-out-paths nixpkgs#wine64Packages.minimal)/bin/wine
+          export RUN_EXEC
+          export WINEPREFIX="$RUNNER_TEMP/wineprefix" WINEDEBUG=-all
+          export WINEDLLOVERRIDES="mscoree,mshtml="
+          unset DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
+          # upload-artifact does not preserve the executable bit; wine needs it.
+          # (Windows does not: an .exe is executable there by extension.)
+          chmod -R u+rwX .
+          # wine maps the whole unix filesystem at Z:.
+          export STAGE_ABS="Z:$PWD"
+        else
+          export RUN_EXEC=""
+          export STAGE_ABS="$(pwd -W)"
+        fi
+        echo "cwd=$(pwd)  STAGE_ABS=$STAGE_ABS  RUN_EXEC=${RUN_EXEC:-<direct exec>}"
+        echo "staged targets: $(find . -mindepth 1 -maxdepth 1 -type d | sed 's|^\./||' | sort | tr '\n' ' ')"
+
+        printf '%s\n' "$SMOKE" > "$RUNNER_TEMP/smoke.sh"
+        bash -euo pipefail "$RUNNER_TEMP/smoke.sh"
