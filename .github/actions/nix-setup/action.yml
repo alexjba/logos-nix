@@ -41,6 +41,22 @@ runs:
           ${{ inputs.github-token && format('access-tokens = github.com={0}', inputs.github-token) || '' }}
           ${{ inputs.extra-conf }}
 
+    # An absent token is not an error -- a fork PR legitimately has no secrets --
+    # but it is never harmless, and it is invisible: the job simply gets slower,
+    # for ever, with nothing in the log to say why. Four repos in this org push
+    # to no cache today. For the Windows target the difference is minutes versus
+    # hours, so say it out loud.
+    - name: Warn when the cache is read-only
+      if: inputs.cachix-auth-token == ''
+      shell: bash
+      run: |
+        echo "::warning::CACHIX_AUTH_TOKEN is empty: the logos-co cache is READ-ONLY here."
+        echo "::warning::Nothing this job builds will be pushed, so the next run rebuilds it"
+        echo "::warning::from source, and so does every other repo that needed the same paths."
+        echo "::warning::Expected on a fork PR (secrets are withheld by design)."
+        echo "::warning::On a push to a branch of this repo it means the secret is missing --"
+        echo "::warning::add it, or accept that this job never gets faster than its cold time."
+
     # No `continue-on-error` here, ever. A silently failed push means every
     # subsequent run rebuilds the whole mingw Qt stack from source -- which for
     # the Windows target is the difference between 10 minutes and several hours.

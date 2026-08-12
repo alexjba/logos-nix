@@ -108,12 +108,27 @@ jobs:
       - name: Report what is now cached
         run: |
           set -euo pipefail
+          # Probe the cache for the paths we just pushed. A green build that
+          # pushed nothing looks identical to one that pushed everything, right
+          # up until the next job rebuilds Qt from source, so ask cachix.
+          ATTRS=(
+            'github:logos-co/logos-logoscore-cli#packages.x86_64-windows.cli'
+            'github:logos-co/logos-liblogos#packages.x86_64-windows.portable'
+          )
+          miss=0
           {
             echo "### Windows cache primed"
-            for a in 'github:logos-co/logos-logoscore-cli#packages.x86_64-windows.cli'; do
+            for a in "${ATTRS[@]}"; do
               p=$(nix eval --raw "$a.outPath")
               h=$(basename "$p" | cut -d- -f1)
               code=$(curl -s -o /dev/null -w '%{http_code}' "https://logos-co.cachix.org/$h.narinfo")
               echo "- \`$a\` → HTTP $code"
+              [ "$code" = 200 ] || miss=1
             done
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$miss" -ne 0 ]; then
+            echo "::error::a path this job built is NOT in logos-co.cachix.org."
+            echo "::error::The push failed or the token is read-only — priming did not happen,"
+            echo "::error::and every Windows job will still start from source."
+            exit 1
+          fi
