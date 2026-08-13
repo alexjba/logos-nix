@@ -12,16 +12,46 @@
 #   Windows, non-bash       rc=0       rc=-1073741515 (0xC0000135),     n/a
 #     parent (PowerShell)              stdout AND stderr both EMPTY
 #   Windows, Git-Bash/MSYS  rc=0       rc=127, stdout empty, stderr     rc=127, "No such
-#     parent (the CI leg)              names an ARBITRARY dependency    file or directory"
-#                                      -- libgcc_s_seh-1.dll every
-#                                      time, whichever DLL was
-#                                      actually removed
+#     parent (the CI leg)              names A dependency -- NOT        file or directory"
+#                                      reliably the missing one
 #   wine on Linux           rc=0       rc=53 (0xC0000135 & 0xFF),       rc=53 + "wine:
 #                                      stdout AND stderr both EMPTY     failed to open"
+#
+#   THE MSYS COLUMN, MEASURED RATHER THAN ASSUMED
+#     An earlier revision of this comment said the MSYS line names
+#     "libgcc_s_seh-1.dll every time, whichever DLL was actually removed".
+#     That is false. Measured on Windows 11 (26200), MSYS bash 5.3.15, against
+#     a real cross-built lgpm.exe + its 26 shipped DLLs, removing each DLL in
+#     turn from an otherwise-working tree:
+#
+#       9 of 26 removals broke the load (rc=127, stdout empty).
+#         7 of those 9 named `api-ms-win-crt-string-l1-1-0.dll` -- a Windows
+#           API-set DLL that is present and was never touched. (liblgx.dll,
+#           libsodium-26.dll, libstdc++-6.dll, zlib1.dll, icuuc76.dll,
+#           icudt76.dll, libmcfgthread-2.dll all produce that same line.)
+#         2 of those 9 named the DLL actually removed (libgcc_s_seh-1.dll,
+#           libpackage_manager_lib.dll) -- which is presumably where the
+#           "libgcc every time" belief came from: one sample, generalised.
+#       17 of 26 removals did not break the load at all (rc=0, full output):
+#         they are not on the --help path's load-time closure.
+#
+#     So the useful, true statement is narrow: the name in that stderr line is
+#     EVIDENCE THAT THIS IS A LOADER FAILURE, and is NOT the identity of the
+#     missing dependency. This file uses it only for the former.
 #
 #   So under bash, 127 means EITHER "the path is wrong" OR "a DLL is missing",
 #   and under wine 53 means either and prints nothing at all. The pre-flight
 #   existence check separates the two; the exit-code case names the other one.
+#
+# EVERY DIAGNOSTIC THIS SCRIPT EMITS GOES TO STDERR.
+#   Not cosmetic. The documented smoke idiom pipes this wrapper --
+#   `run lgx/bin/lgx.exe --help | grep -qi usage` -- and a diagnosis written to
+#   stdout is swallowed by the consumer. Measured with this script and a 127
+#   loader failure: run alone printed the full eight-line story; the same
+#   failure through `| grep -qi usage` reached the log as ONE raw MSYS line and
+#   nothing else. GitHub parses `::error::` on stderr as well as stdout, so this
+#   costs nothing and makes the wrapper's whole reason for existing survive a
+#   pipe. The PROGRAM's own stdout stays on stdout, so `| grep` still works.
 #
 # CONTRACT
 #   Paths are relative to the staged tree ROOT, which holds one directory per
@@ -30,19 +60,22 @@
 #   command that legitimately produces no output.
 set -uo pipefail
 
+# All ::error:: output goes to stderr. See above.
+err() { while [ "$#" -gt 0 ]; do printf '::error::%s\n' "$1" >&2; shift; done; }
+
 RUN_ALLOW_SILENT="${RUN_ALLOW_SILENT:-}"
 if [ "${1:-}" = "-q" ]; then RUN_ALLOW_SILENT=1; shift; fi
 
 pe="${1:-}"
-[ -n "$pe" ] || { echo "::error::run: no program given"; exit 1; }
+[ -n "$pe" ] || { err "run: no program given"; exit 1; }
 
 if [ ! -f "$pe" ]; then
-  echo "::error::run: '$pe' does not exist (cwd: $(pwd))."
-  echo "::error::Smoke paths are relative to the staged tree ROOT, and the root holds"
-  echo "::error::one directory PER TARGET -- so a path starts with the target name:"
-  echo "::error::    run lgx/bin/lgx.exe --help      not    run bin/lgx.exe --help"
-  echo "::error::staged targets here: $(find . -mindepth 1 -maxdepth 1 -type d \
-                                          | sed 's|^\./||' | sort | tr '\n' ' ')"
+  err "run: '$pe' does not exist (cwd: $(pwd))." \
+      "Smoke paths are relative to the staged tree ROOT, and the root holds" \
+      "one directory PER TARGET -- so a path starts with the target name:" \
+      "    run lgx/bin/lgx.exe --help      not    run bin/lgx.exe --help" \
+      "staged targets here: $(find . -mindepth 1 -maxdepth 1 -type d \
+                                | sed 's|^\./||' | sort | tr '\n' ' ')"
   exit 1
 fi
 
@@ -81,32 +114,55 @@ case "$rc" in
       elif grep -qiE '\.dll|loading shared libraries|cannot open shared object' "$e"; then
         loaderish=1                     # MSYS: names A dependency (not necessarily the right one)
       fi
-      if [ "$loaderish" -eq 1 ]; then
-        echo "::error::$pe exited $rc having printed nothing on stdout."
-        echo "::error::That is STATUS_DLL_NOT_FOUND (0xC0000135): the loader could not find a"
-        echo "::error::dependency, so the process died before main() and never got to say so."
-        echo "::error::Do not read the exit code as the whole story -- from a Git-Bash parent"
-        echo "::error::the accompanying 'error while loading shared libraries' line names an"
-        echo "::error::ARBITRARY dependency, not the missing one (measured: libgcc_s_seh-1.dll"
-        echo "::error::every time, whichever DLL was actually removed)."
-        echo "::error::The import-closure gate should have caught this on the builder; if it"
-        echo "::error::did not, either the artifact lost a file in transit or the DLL is"
-        echo "::error::loaded at RUNTIME (LoadLibrary), which no import table records."
-        echo "::error::Shipped beside it:"
+
+      # -q CHANGES WHAT THE SILENCE MEANS, so it has to be consulted HERE and
+      # not only in the exit-0 branch below. The whole loader diagnosis rests on
+      # "stdout was empty and that is abnormal". For a command the caller has
+      # declared legitimately silent, empty stdout is normal and therefore
+      # evidence of nothing -- so asserting STATUS_DLL_NOT_FOUND at the next
+      # reader would be the same confident-wrong-answer this file elsewhere
+      # refuses to give. Report the failure; do not claim to know its cause.
+      if [ "$loaderish" -eq 1 ] && [ -n "$RUN_ALLOW_SILENT" ]; then
+        err "$pe exited $rc." \
+            "It was invoked with -q, i.e. the caller declared this command legitimately" \
+            "silent, so its empty stdout is NOT evidence of anything and this is NOT" \
+            "diagnosed as a missing DLL. It may still be one: re-run this command" \
+            "WITHOUT -q, where silence becomes meaningful again." \
+            "Shipped beside it:"
         # shellcheck disable=SC2012  # these are DLL names, not arbitrary input
-        ls -1 "$(dirname "$pe")" | sed 's/^/::error::  /'
+        ls -1 "$(dirname "$pe")" | sed 's/^/::error::  /' >&2
+        rm -f "$e"
+        exit "$rc"
+      fi
+
+      if [ "$loaderish" -eq 1 ]; then
+        err "$pe exited $rc having printed nothing on stdout." \
+            "That is STATUS_DLL_NOT_FOUND (0xC0000135): the loader could not find a" \
+            "dependency, so the process died before main() and never got to say so." \
+            "Do NOT read the DLL named in the 'error while loading shared libraries'" \
+            "line above as the missing one. Measured on Windows 11 against a real" \
+            "lgpm.exe + 26 DLLs, removing each in turn: of the 9 removals that broke" \
+            "the load, 7 named api-ms-win-crt-string-l1-1-0.dll -- a system DLL that" \
+            "was present the whole time -- and only 2 named the DLL actually removed." \
+            "The name tells you THAT this is a loader failure, not WHICH file is gone." \
+            "The import-closure gate should have caught this on the builder; if it" \
+            "did not, either the artifact lost a file in transit or the DLL is" \
+            "loaded at RUNTIME (LoadLibrary), which no import table records." \
+            "Shipped beside it:"
+        # shellcheck disable=SC2012  # these are DLL names, not arbitrary input
+        ls -1 "$(dirname "$pe")" | sed 's/^/::error::  /' >&2
         rm -f "$e"
         exit 1
       fi
       if grep -qi '^wine:' "$e"; then
-        echo "::error::$pe exited $rc: wine itself refused to launch it (message above)."
-        echo "::error::A launch failure, but NOT the silent 0xC0000135 shape -- that one"
-        echo "::error::prints nothing at all under wine."
+        err "$pe exited $rc: wine itself refused to launch it (message above)." \
+            "A launch failure, but NOT the silent 0xC0000135 shape -- that one" \
+            "prints nothing at all under wine."
       else
-        echo "::error::$pe exited $rc with no stdout, but its stderr above is not a"
-        echo "::error::loader failure -- it names no DLL, and a real 0xC0000135 either says"
-        echo "::error::nothing at all (wine) or names a dependency (MSYS). Read it as the"
-        echo "::error::program's own failure; this is NOT diagnosed as a missing DLL."
+        err "$pe exited $rc with no stdout, but its stderr above is not a" \
+            "loader failure -- it names no DLL, and a real 0xC0000135 either says" \
+            "nothing at all (wine) or names a dependency (MSYS). Read it as the" \
+            "program's own failure; this is NOT diagnosed as a missing DLL."
       fi
       rm -f "$e"
       exit "$rc"
@@ -115,13 +171,13 @@ esac
 rm -f "$e"
 
 if [ "$rc" -eq 0 ] && [ "$osz" -eq 0 ] && [ "$esz" -eq 0 ] && [ -z "$RUN_ALLOW_SILENT" ]; then
-  echo "::error::$pe exited 0 and printed nothing at all."
-  echo "::error::Silent success is this project's dominant defect class -- an install rule"
-  echo "::error::that copied nothing, a package that labelled itself linux-amd64, a plugin"
-  echo "::error::shipped without its DLLs, a reply never sent. Every one of them exited 0."
-  echo "::error::A smoke test that cannot tell 'it worked' from 'it did nothing' is not"
-  echo "::error::coverage."
-  echo "::error::If this command is legitimately silent, invoke it as: run -q $pe ..."
+  err "$pe exited 0 and printed nothing at all." \
+      "Silent success is this project's dominant defect class -- an install rule" \
+      "that copied nothing, a package that labelled itself linux-amd64, a plugin" \
+      "shipped without its DLLs, a reply never sent. Every one of them exited 0." \
+      "A smoke test that cannot tell 'it worked' from 'it did nothing' is not" \
+      "coverage." \
+      "If this command is legitimately silent, invoke it as: run -q $pe ..."
   exit 1
 fi
 

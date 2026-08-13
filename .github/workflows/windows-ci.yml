@@ -246,8 +246,16 @@ jobs:
           mkdir -p stage
           while read -r t; do
             [ -n "$t" ] || continue
-            out=$(nix build --no-link --print-out-paths \
-                    ".#packages.x86_64-windows.$t" "${NIXARGS[@]}" | head -1)
+            # NOT `nix build … | head -1`. `head` exits after the first line
+            # while nix is still printing the remaining outputs of a
+            # multi-output derivation; under `pipefail` that SIGPIPE (141)
+            # becomes the assignment's status and `set -e` kills the step --
+            # a false red whose log says only "Stage". Capture, then take the
+            # first line in the shell, where nothing can be killed.
+            outs=$(nix build --no-link --print-out-paths \
+                     ".#packages.x86_64-windows.$t" "${NIXARGS[@]}")
+            out=${outs%%$'\n'*}
+            [ -n "$out" ] || { echo "::error::nix build printed no out path for '$t'"; exit 1; }
             mkdir -p "stage/$t"
             # --no-preserve=mode is load-bearing, not tidiness. Store outputs
             # are r-xr-xr-x, and a plain `cp -rL` propagates that; the

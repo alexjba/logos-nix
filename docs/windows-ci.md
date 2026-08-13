@@ -85,8 +85,27 @@ DLL removed from an otherwise-working tree:
 | launcher | intact | missing DLL | missing path |
 |---|---|---|---|
 | Windows, non-bash parent | `0`, output | **`-1073741515`** (0xC0000135), stdout **and** stderr empty | n/a |
-| Windows, Git-Bash/MSYS parent (the CI leg) | `0`, output | `127`, stdout empty, stderr names an **arbitrary** dependency — `libgcc_s_seh-1.dll` every time, whichever DLL was actually removed | `127`, "No such file or directory" |
+| Windows, Git-Bash/MSYS parent (the CI leg) | `0`, output | `127`, stdout empty, stderr names **a** dependency — **not reliably the missing one** | `127`, "No such file or directory" |
 | wine 11.0 on Linux | `0`, output | `53` (`0xC0000135 & 0xFF`), stdout **and** stderr empty | `53` + "wine: failed to open" |
+
+### What that MSYS stderr line actually names
+
+An earlier revision of this table, and of `run`'s own header, said it names
+`libgcc_s_seh-1.dll` "every time, whichever DLL was actually removed". **That is
+false.** Re-measured on Windows 11 (26200) under MSYS bash 5.3.15, against a
+real cross-built `lgpm.exe` and its 26 shipped DLLs, removing each DLL in turn
+from an otherwise-working tree:
+
+| outcome | count | the DLL the stderr line named |
+|---|---|---|
+| load broke (`127`, stdout empty) | **9 of 26** | 7 named `api-ms-win-crt-string-l1-1-0.dll` — a **system** DLL that was present the whole time; 2 named the DLL actually removed (`libgcc_s_seh-1.dll`, `libpackage_manager_lib.dll`) |
+| no failure at all (`0`, full output) | **17 of 26** | — those DLLs are not on the `--help` path's load-time closure |
+
+So the true and still-useful statement is narrower: **the name in that line is
+evidence that this *is* a loader failure, and is not the identity of the missing
+file.** `run` uses it only for the former, and now says so. The "libgcc every
+time" belief looks like one sample generalised — removing `libgcc_s_seh-1.dll`
+is in fact one of the two cases where the name happens to be right.
 
 So `run`:
 
@@ -107,7 +126,112 @@ So `run`:
 * treats **exit 0 with no output at all** as a failure. Silent success is this
   project's dominant defect class; a smoke test that cannot tell "it worked"
   from "it did nothing" is not coverage. Use `run -q` for a command that is
-  genuinely silent.
+  genuinely silent;
+* honours `-q` in the **`53`/`127`** branch too, not only in the exit-0 one.
+  The loader diagnosis rests entirely on "stdout was empty and that is
+  abnormal". For a command the caller has declared legitimately silent, empty
+  stdout is evidence of nothing, so `run -q` reports the failure and its exit
+  code but explicitly does **not** assert STATUS_DLL_NOT_FOUND. Measured on
+  Windows 11 against a real 127: without `-q`, 39 `::error::` lines including
+  the full diagnosis; with `-q`, the failure is reported and the DLL story is
+  not;
+* writes **every one of its own diagnostics to stderr**. The program's stdout
+  stays on stdout, so `run … | grep` still works — but the wrapper's whole
+  reason for existing now survives being piped. Measured on Windows 11 with a
+  real missing-DLL failure: through `run … | grep -qi usage`, the shipped
+  version delivered **0** of its `::error::` lines to the log (`grep -q` ate
+  them all, leaving only the raw MSYS line the table above says is unreliable);
+  the current version delivers all **39**. GitHub parses `::error::` on stderr
+  as well as stdout, so this costs nothing.
+
+## No `producer | grep -q` anywhere, and a lint that keeps it that way
+
+Under `set -euo pipefail`, a producer that is still writing when its consumer
+exits early is killed by SIGPIPE (141), and `pipefail` promotes that to the
+pipeline's status. Both possible consequences shipped in this repo, on
+**adjacent lines** of the `.lgx` gate. Measured on `ubuntu:24.04` / GNU tar 1.35
+/ bash 5.2 — the builder's own platform — against `.lgx` fixtures built from
+real cross-built PEs:
+
+```
+tar tzf "$lgxf" | grep -q '^variants/windows-x86_64/'
+```
+grep exits at the first match while tar is still listing → `PIPESTATUS 141 0` →
+**false red on a perfectly correct `.lgx`**, at 25 entries and every size above
+it. The `lgx-variant: true` configuration could not pass at all — the very
+configuration the previous round added to unblock.
+
+```
+if tar tzf "$lgxf" | grep -qE '^variants/(linux|darwin)'; then
+```
+The same 141, but here it is an `if` **condition**, so "killed" reads as "no
+match". A `.lgx` carrying `variants/linux-amd64` **passed silently** through the
+check whose own comment calls it a contract. Measured with the linux entry at
+position 2 of 207 → `141 0` → passed; the *same archive* written linux-last →
+`0 0` → correctly refused. The gate's verdict depended on tar member **order**,
+and `lgx add` writes variants in the order they were added.
+
+Two things this makes concrete:
+
+* **It is not enough to know the output is small.** The whole listing is ~1 KB.
+  macOS `bsdtar` block-buffers it and passes both lines; GNU tar flushes per
+  entry and fails both. A gate's correctness must not rest on a libc buffer size
+  — and a fix validated only on a Mac would have looked fine.
+* **Fixing the obvious site alone makes things worse.** In the shipped step the
+  false red at the first line *masks* the silent pass at the second — it exits
+  before reaching it. Repairing only the false red (the natural single-site fix,
+  and the one that unblocks the `lgx` configuration) was measured to turn a
+  Linux-carrying `.lgx` from REFUSE into **PASS**:
+
+  | `.lgx` gate | correct windows-only `.lgx` | `.lgx` carrying `variants/linux-amd64` |
+  |---|---|---|
+  | as shipped | **REFUSE** (wrong) | REFUSE (right answer, wrong line) |
+  | only the false red repaired | PASS | **PASS** (wrong) |
+  | swept, both sites | PASS | REFUSE |
+
+The fix everywhere is **capture, then test** — `names=$(tar tzf "$f")`, then
+`grep -q … <<<"$names"`. It runs `tar` once instead of four times per archive,
+and it is strictly stronger: the capture form fails under `set -e` when tar
+itself fails, whereas `if tar … | grep` reads an **unreadable** archive as "no
+non-Windows variant" and waves it through. Truncated diagnostics use
+`sed -n '1,Np'`, which reads to EOF, rather than `head -N`, which exits early and
+aborts the step at 141 *before* the `exit 1` that was going to explain the real
+problem.
+
+`.github/lint-actions.sh` rule (3) refuses the pattern outright. Run against the
+pre-sweep tree it independently finds all **15** sites in 6 `run:` blocks, at
+exact line numbers.
+
+## `actionlint clean` covered less than it sounded like
+
+Two gaps, both measured with actionlint 1.7.12:
+
+* **Scope.** Bare `actionlint` lints `.github/workflows` and nothing else. Point
+  it at any of the three composite actions and it rejects the file outright —
+  `"jobs" section is missing in workflow [syntax-check]`, exit 1. So the three
+  `action.yml` files — 8 of the 20 `run:` blocks, and *every gate* — had never
+  been linted by anything.
+* **Interpolation.** actionlint substitutes a placeholder for `${{ }}` before
+  handing a script to shellcheck, so it is *structurally* incapable of catching
+  interpolation-into-shell — the class that put `[ -z "${{ inputs.smoke }}" ]`
+  into an earlier revision of this design, lint-clean. **A clean actionlint run
+  is not evidence about that class.**
+
+`.github/lint-actions.sh` (wired up by `.github/workflows/lint-ci.yml`) covers
+both, over every workflow *and* every composite action:
+
+1. shellcheck on each `run:` block;
+2. **no `${{ }}` inside any `run:` block** — the rule forbids the construct
+   rather than trying to parse it, which is why it covers what actionlint
+   cannot. Caller data reaches a shell through `env:` or not at all;
+3. no producer piped into an early-exiting consumer (see above).
+
+It runs its own `--self-test` first, on every run: a linter that has silently
+stopped matching anything reports exactly what a clean tree reports. Whole-line
+comments are blanked before rules 2 and 3, so the comments that *explain* these
+patterns do not trip them. A file `yq` cannot parse is an **error**, never "0
+run blocks" — the first draft had `|| echo 0` there and reported "clean" on a
+tree containing a workflow with a YAML syntax error, which actionlint caught.
 
 ## The artifact round trip is asserted, not assumed
 
@@ -125,6 +249,29 @@ agree about nothing: an empty tree carrying an empty manifest used to print
 "artifact round trip verified: 0 PEs" and exit 0, and the smoke script then ran
 against nothing. An artifact must carry at least one PE, or at least one `.lgx`
 (the one shape whose PEs legitimately live inside an archive).
+
+### …and it never fails without naming a file
+
+The comparison and its diagnosis used to disagree about what a line is.
+Reproduced on Windows 11 / MSYS bash 5.3.15 / GNU grep 3.0 with a **CRLF**
+`pe-manifest.txt` carrying the same three PEs: `cat` is byte-exact so the `!=`
+fired, but MSYS grep strips the CR before matching, so both `grep -Fxv -f` calls
+found every line present and printed **nothing**. The step failed having named
+no file at all — the least actionable possible red, for a tree that had lost
+nothing.
+
+A CR is not a missing PE. The sets are now compared **CR-normalised**; a
+line-ending-only difference is a `::warning::`, not a failure. And if the
+normalised sets really do differ but neither `grep` can localise it, both
+listings are printed in full rather than the step exiting on an empty
+explanation. Measured on Windows, original vs current:
+
+| case | shipped | current |
+|---|---|---|
+| CRLF manifest, same 3 PEs | **fails, names 0 files** | passes, warns about the line endings |
+| one PE genuinely lost in transit | fails, names it | fails, names it |
+| manifest and listing in different **order**, same PEs | **fails, names 0 files** | fails, prints both listings whole |
+| intact tree | passes | passes |
 
 ## The gates' reader is pinned, and proved
 
@@ -144,6 +291,31 @@ imports, and zero imports is also what a perfectly bundled tree reports.
 
 `$OBJDUMP` is exported to `$GITHUB_ENV`, so a caller's `extra-gates` script uses
 that same verified binary instead of resolving a second one.
+
+The `--info` check is itself run on a **captured** string rather than
+`objdump --info | grep -qw`, because that pipeline is the SIGPIPE shape above in
+the worst possible place: `if ! <pipeline>` inverts, so a 141 would **refuse a
+perfectly good objdump** and take the whole gates action down with a message
+accusing the reader of not supporting PE. Measured on `ubuntu:24.04` (Ubuntu's
+own binutils, as a size proxy — the pinned 2.46 store path was not reachable on
+this host): `x86_64-w64-mingw32-objdump --info` is 2042 B / 81 lines and squeaks
+under the stdio buffer (`0 0`, passes today), while a multi-target
+`/usr/bin/objdump --info` is 31153 B / 742 lines and gives `141 0`. A
+mingw-only binutils lists only its own targets; the gate's correctness should
+not rest on that table staying under ~4 KB.
+
+### wine is pinned the same way, for the same reason
+
+The Linux leg's launcher used to come from `nixpkgs#wine64Packages.minimal` —
+the runner's **floating flake registry**, exactly the source the objdump finding
+rejected one layer up, and the most likely first failure nobody could diagnose
+from the log. wine is what decides whether every PE in a repo "starts", so an
+unpinned wine is an unpinned verdict. It now resolves from logos-nix's own
+`flake.lock` via `path:$GITHUB_ACTION_PATH/../../..#legacyPackages.x86_64-linux.wine64Packages.minimal`
+(verified against this repo's pin: `wine64-10.0`), and the action asserts wine
+can report its own version before running anything — a launcher that cannot
+start makes *every* binary look like a `0xC0000135` loader failure and blames the
+artifact.
 
 ## What a repo with no Windows target does
 
@@ -183,6 +355,30 @@ stayed green. A job that passes by skipping is worse than no job.
 There is also a floor on the listing itself: fewer than 20 repos is treated as a
 degraded API call, not a smaller org.
 
+### 404 is not an authoritative answer
+
+The last silent-skip path was the one that looked most like a real answer.
+GitHub returns **404 for a resource the token may not see**, so "this repo has
+no `flake.nix`" and "this token cannot see this repo's contents" arrive as the
+same status code — and 404 was filed straight into *no flake — nothing to
+evaluate*, a bucket that does not fail the job. Reproduced by driving the
+shipped step with a `gh` that 404s every contents probe: **25 repos, all 25
+filed "no flake", exit 0.** The bucket-accounting check cannot see it, because
+the repos genuinely *are* filed.
+
+So the classifier is now calibrated against known answers before it is trusted,
+the same way the import gate calibrates its objdump: probe a file that must
+exist and a path that must not, **at both ends of the loop** (a token that
+degrades halfway through turns every remaining repo into a silent "no flake").
+Plus one blunt corroborating rule: logos-co is a Nix workspace, so a result in
+which *nothing* has a flake is a finding about the probe, not about the org.
+
+| contents probe | shipped | current |
+|---|---|---|
+| 404s everything | **exit 0**, 25/25 "no flake" | exit 1 — canary: known-present read 404 |
+| canary repo visible, every other repo 404 | **exit 0**, 25/25 "no flake" | exit 1 — canary passes, "all 25 repos classified no flake" fires |
+| healthy | exit 0, 25 out of scope | exit 0, 25 out of scope, canary clean at both ends |
+
 ## Versioning: what `@v1` covers
 
 `windows-ci.yml` is a **cross-repo** reusable workflow, so it cannot reference
@@ -199,11 +395,12 @@ same string the callers use.
 
 That rule is about the *reusable workflow* only, and the distinction is easy to
 "fix" in the wrong direction. logos-nix's own workflows —
-`windows-cache-prime.yml` (3 sites) and `windows-fleet-audit.yml` (1) — run in
-**this** repo's checkout, where `uses: ./.github/actions/nix-setup` resolves
-correctly and pins nothing to a tag that may not exist yet. They are right as
-they are. Only a workflow that is `uses:`-ed *by another repo* has to spell its
-siblings absolutely, because that one is evaluated in the caller's workspace.
+`windows-cache-prime.yml` (3 sites), `windows-fleet-audit.yml` (1) and
+`lint-ci.yml` (1) — run in **this** repo's checkout, where
+`uses: ./.github/actions/nix-setup` resolves correctly and pins nothing to a tag
+that may not exist yet. They are right as they are. Only a workflow that is
+`uses:`-ed *by another repo* has to spell its siblings absolutely, because that
+one is evaluated in the caller's workspace.
 
 What breaks if the tag moves:
 

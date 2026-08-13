@@ -61,9 +61,15 @@ jobs:
           # scope, network). Treating the second as the first is how an audit
           # skips a repo, or the whole fleet, and still reports success. So
           # classify on the HTTP status and give anything else its own bucket.
+          # `sed -n 1p`, not `head -1`: `head` exits after the first line while
+          # `gh` is still writing the (large, base64) body, so the pipeline's
+          # status is SIGPIPE/141 rather than gh's. Today a `|| true` hides
+          # that; the point is that the `|| true` was load-bearing for the
+          # WRONG reason and would go on hiding a real gh failure. `sed -n 1p`
+          # reads to EOF, so the status that survives is gh's own.
           http_status() {
             local out
-            out=$(gh api -i "$1" 2>/dev/null | head -1) || true
+            out=$(gh api -i "$1" 2>/dev/null | sed -n '1p') || true
             printf '%s' "$out" | sed -n 's|^HTTP/[0-9.]* \([0-9][0-9][0-9]\).*|\1|p'
           }
 
@@ -87,6 +93,46 @@ jobs:
             echo "::error::page or a token that can only see part of the org. Audit not trusted."
             exit 1
           fi
+
+          # -----------------------------------------------------------------
+          # 404 IS NOT AN AUTHORITATIVE ANSWER ON ITS OWN.
+          #
+          # GitHub returns 404 for a resource the token may not see, so "this
+          # repo has no flake.nix" and "this token cannot see this repo's
+          # contents" arrive as THE SAME STATUS CODE. The shipped step filed
+          # 404 straight into "no flake — nothing to evaluate", a bucket that
+          # does not fail the job. Measured on the shipped step with every
+          # contents/flake.nix probe returning 404: a 25-repo fleet classified
+          # all 25 as "no flake" and exited 0 — the last silent-skip path left
+          # in the job whose entire purpose is to have none, and the one the
+          # bucket-accounting check cannot see, because the repos ARE filed.
+          #
+          # So calibrate the classifier against known answers before trusting
+          # it, exactly as the import gate calibrates its objdump: probe a file
+          # that MUST exist and a path that MUST NOT, in this very repo. If a
+          # file known to be present reads 404, every 404 in this run is noise.
+          #
+          # Run at BOTH ends of the loop: a token that degrades halfway through
+          # turns every remaining repo into a silent "no flake", which is the
+          # same failure over fewer repos and just as green.
+          # -----------------------------------------------------------------
+          CANARY_REPO=logos-nix
+          canary() {
+            local present absent
+            present=$(http_status "repos/logos-co/$CANARY_REPO/contents/flake.nix")
+            absent=$(http_status "repos/logos-co/$CANARY_REPO/contents/__no_such_file_$$__")
+            echo "contents-probe canary ($1): known-present=$present known-absent=$absent"
+            if [ "$present" != 200 ] || [ "$absent" != 404 ]; then
+              echo "::error::the contents probe is not answering correctly ($1)."
+              echo "::error::A file known to EXIST read HTTP ${present:-<no status line>} (expected 200);"
+              echo "::error::a path known NOT to exist read HTTP ${absent:-<no status line>} (expected 404)."
+              echo "::error::Every 404 in this run therefore means nothing: 'no flake.nix' and"
+              echo "::error::'this token cannot see it' are the same code. An audit that cannot"
+              echo "::error::tell them apart reports a clean fleet by skipping it. Refusing."
+              return 1
+            fi
+          }
+          canary 'before the loop'
 
           : > covered.txt; : > drift.txt; : > noneed.txt
           : > broken.txt; : > noflake.txt; : > outofscope.txt
@@ -140,6 +186,11 @@ jobs:
             fi
           done 3< repos.txt
 
+          # The classifier must still be answering correctly now that the loop
+          # is done, or every 404 it returned along the way is uninterpretable.
+          canary_rc=0
+          canary 'after the loop' || canary_rc=1
+
           # Every listed repo must have landed in exactly one bucket. This is
           # the check that would have caught the failure above without anyone
           # having to think of it: a repo that falls out of the loop silently
@@ -165,7 +216,16 @@ jobs:
             sed 's/^/- /' broken.txt
           } >> "$GITHUB_STEP_SUMMARY"
 
-          rc=0
+          rc=$canary_rc
+          # Belt and braces behind the canary. logos-co is a Nix workspace: a
+          # result in which NOTHING has a flake is not a finding about the org,
+          # it is a finding about the probe.
+          if [ "$n_noflake" -eq "$n_repos" ] && [ "$n_repos" -gt 0 ]; then
+            echo "::error::all $n_repos repos classified 'no flake — nothing to evaluate'."
+            echo "::error::Every repo in this org is a flake. That is a degraded contents probe,"
+            echo "::error::not a fleet without flakes, and it would have exited 0."
+            rc=1
+          fi
           if [ "$total" -ne "$n_repos" ]; then
             echo "::error::bucket accounting: $total classified vs $n_repos listed."
             echo "::error::A repo left the loop without being filed anywhere, so this audit"

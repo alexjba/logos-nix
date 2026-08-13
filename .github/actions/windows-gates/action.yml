@@ -44,6 +44,49 @@ inputs:
     required: false
     default: '{}'
 
+# ---------------------------------------------------------------------------
+# NO `producer | grep -q`, NO `producer | head`, ANYWHERE IN THIS FILE.
+#
+# Under `set -euo pipefail` a producer that is still writing when its consumer
+# exits early is killed by SIGPIPE (141), and `pipefail` promotes that to the
+# pipeline's status. Both possible consequences shipped here, on ADJACENT lines
+# of the .lgx gate. Measured on ubuntu:24.04 / GNU tar 1.35 / bash 5.2 -- the
+# builder's own platform -- against .lgx fixtures built from real cross-built
+# PEs:
+#
+#   tar tzf "$lgxf" | grep -q '^variants/windows-x86_64/'
+#     grep exits at the first match; tar is still listing.  PIPESTATUS 141 0.
+#     FALSE RED on a .lgx that is perfectly correct -- at 25 entries and at
+#     every size above it. The lgx-variant configuration could not pass AT ALL.
+#
+#   if tar tzf "$lgxf" | grep -qE '^variants/(linux|darwin)'
+#     Same 141, but here it is the `if` condition, so the pipeline reading
+#     "killed" is read as "no match". A .lgx carrying variants/linux-amd64
+#     PASSED SILENTLY through the check whose own comment calls it a contract.
+#     Measured: linux entry at position 2 of 207 -> PIPESTATUS 141 0 -> PASSED.
+#     With the same archive written linux-LAST -> 0 0 -> correctly REFUSED.
+#     So the gate's verdict depended on tar member ORDER, and `lgx add` writes
+#     variants in the order they were added -- linux first, in practice.
+#
+# It is NOT enough to know the output is small. macOS bsdtar block-buffers its
+# listing and passes both lines; GNU tar flushes per entry and fails both. The
+# gate's correctness must not rest on a libc buffer size.
+#
+# THE FIX EVERYWHERE IS: CAPTURE, THEN TEST.
+# It costs one variable, it runs `tar` ONCE instead of four times per archive,
+# and it is strictly stronger -- `names=$(tar tzf ...)` fails under `set -e`
+# when tar itself fails, whereas the `if tar ... | grep` form reads an
+# unreadable archive as "no non-Windows variant" and passes it. (Measured: a
+# missing archive gives rc=2 with the capture form, and a silent pass with the
+# shipped form.)
+#
+# Diagnostics use `sed -n '1,Np'` rather than `head -N` for the same reason:
+# `head` exits early and takes the `find` with it, so `set -e` aborts the step
+# at 141 BEFORE the `exit 1` that was supposed to report the real problem.
+# Measured: `cat big | head -3` -> 141, `cat big | sed -n 1,3p` -> 0.
+#
+# `.github/lint-actions.sh` enforces this; see docs/windows-ci.md.
+# ---------------------------------------------------------------------------
 runs:
   using: composite
   steps:
@@ -74,7 +117,7 @@ runs:
         echo "PE candidates: ${#pes[@]} (floor $MIN_PES)"
         if [ "${#pes[@]}" -lt "$MIN_PES" ]; then
           echo "::error::only ${#pes[@]} PE files staged, expected >= $MIN_PES — a target installed nothing"
-          find "$STAGE" -type f | head -50
+          find "$STAGE" -type f | sed -n '1,50p'
           exit 1
         fi
 
@@ -88,10 +131,15 @@ runs:
 
         # A silent fallback to a NATIVE build emits unsuffixed ELF binaries,
         # which the *.exe/*.dll filter above would never even look at.
+        #
+        # `case` on a captured string, not `file … | grep -q`: a `grep -q` that
+        # matches kills `file` and pipefail turns the 141 into "no match", i.e.
+        # an ELF that silently passes. `file` is short enough today that it
+        # wins the race, but that is a buffer size, not a guarantee.
         while read -r f; do
-          if file -b "$f" | grep -q ELF; then
-            echo "::error::native ELF binary in a Windows output: $f"; bad=1
-          fi
+          case "$(file -b "$f")" in
+            *ELF*) echo "::error::native ELF binary in a Windows output: $f"; bad=1 ;;
+          esac
         done < <(find "$STAGE" -type f ! -name '*.exe' ! -name '*.dll')
 
         # The static-library tier. A mingw .a is an ar archive of COFF objects;
@@ -105,9 +153,11 @@ runs:
             bad=1
           fi
           for a in "${archives[@]}"; do
-            if ! file -b "$a" | grep -qi 'archive'; then
-              echo "::error::not an ar archive: $a — $(file -b "$a")"; bad=1; continue
-            fi
+            kind=$(file -b "$a")
+            case "$kind" in
+              *[Aa]rchive*) ;;
+              *) echo "::error::not an ar archive: $a — $kind"; bad=1; continue ;;
+            esac
             # `file` on the archive itself is not enough: it reports "current ar
             # archive" for both. Look at a member.
             #
@@ -118,9 +168,19 @@ runs:
             # declared "contains no object members" on two perfectly good
             # archives. It failed RED, which is the right direction -- but the
             # same mistake pointed the other way is how a gate passes on nothing.
-            m=$(ar t "$a" 2>/dev/null | grep -m1 -E '\.(o|obj)$' || true)
+            #
+            # Captured, not `ar t | grep -m1`. `grep -m1` exits at the first
+            # match while `ar` is still listing, so the pipeline is 141 and the
+            # `|| true` that used to be here swallowed it -- which also
+            # swallowed a genuine `ar` failure on an unreadable archive, and an
+            # unreadable archive would then be reported as "contains no .o/.obj
+            # members" rather than as the read error it is.
+            if ! members=$(ar t "$a" 2>&1); then
+              echo "::error::cannot list $a: $(printf '%s\n' "$members" | sed -n '1,5p')"; bad=1; continue
+            fi
+            m=$(printf '%s\n' "$members" | grep -E '\.(o|obj)$' | sed -n '1p')
             if [ -z "$m" ]; then
-              echo "::error::$a contains no .o/.obj members: $(ar t "$a" 2>&1 | head -5)"; bad=1; continue
+              echo "::error::$a contains no .o/.obj members: $(printf '%s\n' "$members" | sed -n '1,5p')"; bad=1; continue
             fi
             rm -rf .arprobe && mkdir .arprobe
             ( cd .arprobe && ar x "$OLDPWD/$a" "$m" )
@@ -170,7 +230,7 @@ runs:
           echo "::error::expected the logos-nix flake at $ROOT (from \$GITHUB_ACTION_PATH)."
           echo "::error::Without it the objdump would have to come from an unpinned source,"
           echo "::error::and a gate whose reader is unpinned is not a gate. Refusing to guess."
-          find "$ROOT" -maxdepth 1 | head -20
+          find "$ROOT" -maxdepth 1 | sed -n '1,20p'
           exit 1
         fi
         ATTR="path:$ROOT#legacyPackages.x86_64-linux.pkgsWindows.buildPackages.binutils"
@@ -189,14 +249,34 @@ runs:
         # Positive control. An objdump that cannot parse PE prints no import
         # table, and "no imports" is what a COMPLETE bundle also looks like --
         # a wrong reader would turn this gate into a green rubber stamp.
-        if ! "$OBJDUMP" --info | grep -qw 'pei-x86-64'; then
+        #
+        # CAPTURED, not `"$OBJDUMP" --info | grep -qw`. That pipeline is the
+        # SIGPIPE shape from the header, and this is the worst place in the file
+        # for it: `if ! <pipeline>` inverts, so a 141 REFUSES a perfectly good
+        # objdump and takes the whole gates action down with a message accusing
+        # the reader of not supporting PE. Measured on ubuntu:24.04 (Ubuntu's
+        # own binutils, NOT the pinned 2.46 store path -- the emulated-amd64
+        # route to that binary was not usable here, so this is a proxy for its
+        # SIZE and a direct measurement of the pipeline's behaviour at that
+        # size):
+        #   binutils-mingw-w64 x86_64-w64-mingw32-objdump --info
+        #       -> 2042 B / 81 lines  -> PIPESTATUS 0 0    (passes today)
+        #   /usr/bin/objdump --info (multi-target)
+        #       -> 31153 B / 742 lines -> PIPESTATUS 141 0 (would REFUSE)
+        # A mingw-only binutils lists only its own targets and so squeaks under
+        # the stdio buffer. This control's correctness therefore rests on
+        # binutils' target table staying under ~4 KB, which nobody chose and
+        # nobody is watching. It should not rest on anything of the sort.
+        info=$("$OBJDUMP" --info) || {
+          echo "::error::$OBJDUMP --info failed; it cannot be trusted to read PEs."; exit 1; }
+        if ! grep -qw 'pei-x86-64' <<<"$info"; then
           echo "::error::$OBJDUMP does not support the pei-x86-64 target."
           echo "::error::It would report zero imports for every PE, which is indistinguishable"
           echo "::error::from a complete bundle. Refusing to run the import gate with it."
-          "$OBJDUMP" --info | head -20
+          printf '%s\n' "$info" | sed -n '1,20p'
           exit 1
         fi
-        echo "objdump: $OBJDUMP ($("$OBJDUMP" --version | head -1)), pei-x86-64 supported"
+        echo "objdump: $OBJDUMP ($("$OBJDUMP" --version | sed -n '1p')), pei-x86-64 supported"
         echo "OBJDUMP=$OBJDUMP" >> "$GITHUB_ENV"
 
     - name: Gate — every PE's imports are bundled beside it
@@ -226,15 +306,28 @@ runs:
         mapfile -t lgxs < <(find "$STAGE" -name '*.lgx' -type f | sort)
         [ "${#lgxs[@]}" -gt 0 ] || { echo "::error::lgx-variant requested but no .lgx staged"; exit 1; }
         for lgxf in "${lgxs[@]}"; do
+          # ONE listing, captured. See the SIGPIPE note at the top of this file:
+          # both of the lines this replaces were `tar tzf | grep -q`, and they
+          # were the two worked examples of the class -- the first a guaranteed
+          # FALSE RED on any correct .lgx, the second a SILENT PASS for a .lgx
+          # carrying variants/linux-amd64. Capturing also means a tar that
+          # CANNOT read the archive fails here, loudly, instead of being read as
+          # "no non-Windows variant found" and waved through.
+          if ! names=$(tar tzf "$lgxf" 2>&1); then
+            echo "::error::cannot list $lgxf — it is not a readable gzip tar:"
+            printf '%s\n' "$names" | sed -n '1,20p'
+            exit 1
+          fi
+
           # The mislabel this catches: under a mingw cross, isDarwin and
           # isAarch64 are both false, so the variant used to fall through to
           # "linux-amd64" -- a Windows package claiming to be a Linux one. lgpm
           # computes "windows-x86_64" and has no alias fallback, so the exact
           # spelling is a contract.
-          tar tzf "$lgxf" | grep -q '^variants/windows-x86_64/' \
-            || { echo "::error::$lgxf has no variants/windows-x86_64/"; tar tzf "$lgxf"; exit 1; }
-          if tar tzf "$lgxf" | grep -qE '^variants/(linux|darwin)'; then
-            echo "::error::$lgxf carries a non-Windows variant"; tar tzf "$lgxf"; exit 1
+          grep -q '^variants/windows-x86_64/' <<<"$names" \
+            || { echo "::error::$lgxf has no variants/windows-x86_64/"; printf '%s\n' "$names"; exit 1; }
+          if grep -qE '^variants/(linux|darwin)' <<<"$names"; then
+            echo "::error::$lgxf carries a non-Windows variant"; printf '%s\n' "$names"; exit 1
           fi
           # Entry names alone are not enough: a zero-byte payload satisfies the
           # greps above. Extract and check the payload is a real PE.
@@ -242,8 +335,15 @@ runs:
           n=0
           while read -r p; do
             [ -s "$p" ] || { echo "::error::empty payload: $p"; exit 1; }
-            file -b "$p" | grep -q 'PE32+.*x86-64' \
-              || { echo "::error::payload is not a 64-bit PE: $p"; exit 1; }
+            # `case` on a captured string, not `file … | grep -q` — same reason
+            # as the ELF check above and the two lines this step used to open
+            # with. Here a 141 would report a perfectly good PE as "not a
+            # 64-bit PE", i.e. a false red on a correct package.
+            k=$(file -b "$p")
+            case "$k" in
+              *"PE32+"*x86-64*) ;;
+              *) echo "::error::payload is not a 64-bit PE: $p — $k"; exit 1 ;;
+            esac
             n=$((n+1))
           done < <(find .lgxout/variants/windows-x86_64 -type f \( -name '*.dll' -o -name '*.exe' \))
           [ "$n" -gt 0 ] || { echo "::error::$lgxf windows-x86_64 variant contains no PE"; exit 1; }

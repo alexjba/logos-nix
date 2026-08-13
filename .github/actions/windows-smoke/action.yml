@@ -48,7 +48,7 @@ runs:
           echo "::error::If it is absent, the artifact is not the one this workflow produced"
           echo "::error::-- or upload-artifact dropped it (it excludes hidden files, which is"
           echo "::error::why this file is NOT dot-prefixed)."
-          find . -type f | head -50
+          find . -type f | sed -n '1,50p'
           exit 1
         fi
         # A FLOOR, for the same reason windows-gates refuses min-pes: 0 with
@@ -70,7 +70,7 @@ runs:
             echo "::error::There is nothing here to verify and nothing for the smoke script"
             echo "::error::to execute. Check the builder's Stage step: an install rule that"
             echo "::error::copied nothing exits 0 too."
-            find . -type f | head -50
+            find . -type f | sed -n '1,50p'
             exit 1
           fi
           echo "no loose PEs; artifact carries $nlgx .lgx (payload gated on the builder)"
@@ -82,17 +82,45 @@ runs:
         # differ" from "diff is not installed" -- it reports a missing tool as a
         # corrupted artifact. Measured: this check failed exactly that way on a
         # Windows box whose artifact was in fact byte-perfect.
-        if [ "$(cat pe-manifest.txt)" != "$(cat arrived.txt)" ]; then
+        #
+        # COMPARED WITH THE CARRIAGE RETURNS STRIPPED, because the comparison
+        # and the diagnosis disagreed about what a line is. Reproduced on real
+        # Windows 11 / MSYS bash 5.3.15 / GNU grep 3.0 with a CRLF
+        # pe-manifest.txt: `cat` is byte-exact so the `!=` FIRED, but MSYS grep
+        # strips the CR before matching, so both `grep -Fxv -f` calls found
+        # every line present and printed NOTHING -- the step failed having
+        # named no file at all, which is the least actionable possible red.
+        # A CR is not a missing PE. Normalise, compare, and say so separately.
+        tr -d '\r' < pe-manifest.txt > manifest.norm
+        tr -d '\r' < arrived.txt     > arrived.norm
+        if [ "$(cat manifest.norm)" != "$(cat arrived.norm)" ]; then
           echo "::error::the PE set changed between upload and download."
           echo "::error::A PE that vanishes here reappears later as a silent load failure."
-          grep -Fxv -f arrived.txt pe-manifest.txt \
-            | sed 's/^/::error::  LOST in transit: /' || true
-          grep -Fxv -f pe-manifest.txt arrived.txt \
-            | sed 's/^/::error::  APPEARED from nowhere: /' || true
+          grep -Fxv -f arrived.norm manifest.norm \
+            | sed 's/^/::error::  LOST in transit: /' > lost.txt || true
+          grep -Fxv -f manifest.norm arrived.norm \
+            | sed 's/^/::error::  APPEARED from nowhere: /' > extra.txt || true
+          cat lost.txt extra.txt
+          # NEVER fail without naming something. If the two lists disagree but
+          # neither grep can localise it, the tool is lying to us -- print both
+          # sides whole rather than exit on an empty explanation.
+          if [ ! -s lost.txt ] && [ ! -s extra.txt ]; then
+            echo "::error::(the two listings differ but no line could be localised —"
+            echo "::error:: printing both in full rather than failing silently)"
+            echo "::error::--- recorded on the builder ---"
+            sed 's/^/::error::  /' manifest.norm
+            echo "::error::--- found after download ---"
+            sed 's/^/::error::  /' arrived.norm
+          fi
           exit 1
         fi
+        if [ "$(cat pe-manifest.txt)" != "$(cat arrived.txt)" ]; then
+          echo "::warning::pe-manifest.txt and the local listing hold the SAME PE set but"
+          echo "::warning::differ in line endings (CR). Something opened the manifest in text"
+          echo "::warning::mode between upload and download. Not a lost binary; not failed."
+        fi
         [ "$n" -eq 0 ] || echo "artifact round trip verified: $n PEs"
-        rm -f arrived.txt
+        rm -f arrived.txt manifest.norm arrived.norm lost.txt extra.txt
 
     - name: Smoke
       shell: bash
@@ -103,16 +131,74 @@ runs:
         WINE: ${{ inputs.wine }}
       run: |
         set -euo pipefail
-        mkdir -p "$RUNNER_TEMP/bin"
-        cp "$GITHUB_ACTION_PATH/run" "$RUNNER_TEMP/bin/run"
-        chmod +x "$RUNNER_TEMP/bin/run"
-        export PATH="$RUNNER_TEMP/bin:$PATH"
+        # $RUNNER_TEMP is a WINDOWS path on windows-latest (D:\a\_temp) while
+        # $PATH here is consumed by an MSYS-family bash, where `:` is the
+        # separator. `PATH="$RUNNER_TEMP/bin:$PATH"` therefore does NOT add the
+        # directory it looks like it adds. Measured on real Windows 11, MSYS
+        # bash 5.3.15, with RUNNER_TEMP='C:\Users\...\ci-probe':
+        #     PATH[0] = C                                   <- junk entry
+        #     PATH[1] = \Users\...\ci-probe/bin              <- drive DISCARDED
+        # `run` was still found -- but via that second, DRIVE-RELATIVE entry,
+        # which resolves against whatever drive is current. Setting the letter
+        # to Z: produced the identical entry, so the drive letter is thrown
+        # away rather than compared: what makes it work today is that
+        # RUNNER_TEMP's path-after-the-colon happens to exist on the drive the
+        # smoke step is standing on (D:\a\_temp and D:\a\<repo> are both on D:).
+        # Move either one to another drive and `run` silently disappears, and
+        # the smoke script fails with `run: command not found` -- which reads
+        # like the wrapper was never installed.
+        #
+        # So let bash spell the directory itself. `pwd` inside it returns the
+        # POSIX form (/d/a/_temp/bin) on the Windows leg and the plain absolute
+        # path on the Linux leg, so ONE line is correct on both.
+        # Everything downstream uses $TMPDIR_POSIX rather than $RUNNER_TEMP, so
+        # the Windows spelling never reaches a context that splits on ':'.
+        TMPDIR_POSIX=$(cd "$RUNNER_TEMP" && pwd)
+        RUN_BIN=$(mkdir -p "$TMPDIR_POSIX/bin" && cd "$TMPDIR_POSIX/bin" && pwd)
+        [ -n "$RUN_BIN" ] || { echo "::error::could not resolve \$RUNNER_TEMP/bin"; exit 1; }
+        cp "$GITHUB_ACTION_PATH/run" "$RUN_BIN/run"
+        chmod +x "$RUN_BIN/run"
+        export PATH="$RUN_BIN:$PATH"
+        # Prove it, rather than assume it. `run` not being on PATH is otherwise
+        # reported by the smoke script as `run: command not found`, which looks
+        # like a caller mistake instead of a harness one.
+        command -v run >/dev/null || {
+          echo "::error::the 'run' wrapper is not on PATH after installing it to $RUN_BIN."
+          echo "::error::PATH[0]=$(echo "$PATH" | cut -d: -f1)"
+          exit 1; }
+        echo "run wrapper: $(command -v run)"
 
         if [ "$WINE" = 'true' ]; then
-          # Fully substituted from cache.nixos.org: ~53 MiB, 0 derivations built.
-          RUN_EXEC=$(nix build --no-link --print-out-paths nixpkgs#wine64Packages.minimal)/bin/wine
+          # ------------------------------------------------------------------
+          # The wine binary is PINNED, for exactly the reason the gates action's
+          # objdump is. `nixpkgs#wine64Packages.minimal` is the RUNNER'S FLAKE
+          # REGISTRY -- a floating channel tarball nobody in this org controls,
+          # which can differ between two runners in the same workflow. wine is
+          # the thing that decides whether every PE in this repo "starts", so an
+          # unpinned wine is an unpinned verdict.
+          #
+          # $GITHUB_ACTION_PATH/../../.. is the logos-nix checkout GitHub made
+          # for this action, flake.lock included -- the same resolution the
+          # gates action uses. Verified from this repo's own pin:
+          # legacyPackages.x86_64-linux.wine64Packages.minimal -> wine64-10.0.
+          # --no-write-lock-file: that checkout is not a git tree and may be
+          # read-only, so an incomplete lock must fail here rather than have nix
+          # try to write one.
+          # ------------------------------------------------------------------
+          ROOT=$(cd "$GITHUB_ACTION_PATH/../../.." && pwd)
+          if [ ! -f "$ROOT/flake.nix" ] || [ ! -f "$ROOT/flake.lock" ]; then
+            echo "::error::expected the logos-nix flake at $ROOT (from \$GITHUB_ACTION_PATH)."
+            echo "::error::Without it wine would have to come from the runner's floating"
+            echo "::error::registry, and an unpinned launcher is an unpinned verdict."
+            find "$ROOT" -maxdepth 1 | sed -n '1,20p'
+            exit 1
+          fi
+          outs=$(nix build --no-link --no-write-lock-file --print-out-paths \
+                   "path:$ROOT#legacyPackages.x86_64-linux.wine64Packages.minimal")
+          RUN_EXEC="${outs%%$'\n'*}/bin/wine"
+          [ -x "$RUN_EXEC" ] || { echo "::error::no wine at $RUN_EXEC"; exit 1; }
           export RUN_EXEC
-          export WINEPREFIX="$RUNNER_TEMP/wineprefix" WINEDEBUG=-all
+          export WINEPREFIX="$TMPDIR_POSIX/wineprefix" WINEDEBUG=-all
           export WINEDLLOVERRIDES="mscoree,mshtml="
           unset DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
           # There was a `chmod -R u+rwX .` here, with a comment claiming
@@ -128,6 +214,19 @@ runs:
           # a 0664 lgx.exe ran fine under wine. An inert line with a false
           # comment is worse than no line: it is a load-bearing-looking step
           # that would go on being copied.
+          # Positive control on the launcher, for the same reason the gates
+          # action proves its objdump can read PEs before trusting it. A wine
+          # that cannot start AT ALL makes every PE in the tree look like a
+          # 0xC0000135 loader failure -- `run` would print its eight-line
+          # missing-DLL story once per binary and blame the artifact.
+          if ! wver=$("$RUN_EXEC" --version 2>&1); then
+            echo "::error::$RUN_EXEC cannot even report its version:"
+            printf '%s\n' "$wver" | sed -n '1,10p'
+            echo "::error::Every PE would now be reported as a missing-DLL failure. Refusing"
+            echo "::error::to run the smoke script with a launcher that does not work."
+            exit 1
+          fi
+          echo "wine: $RUN_EXEC ($(printf '%s\n' "$wver" | sed -n '1p'))"
           # wine maps the whole unix filesystem at Z:.
           export STAGE_ABS="Z:$PWD"
         else
@@ -149,5 +248,5 @@ runs:
         echo "cwd=$(pwd)  STAGE_ABS=$STAGE_ABS  RUN_EXEC=${RUN_EXEC:-<direct exec>}"
         echo "staged targets: $(find . -mindepth 1 -maxdepth 1 -type d | sed 's|^\./||' | sort | tr '\n' ' ')"
 
-        printf '%s\n' "$SMOKE" > "$RUNNER_TEMP/smoke.sh"
-        bash -euo pipefail "$RUNNER_TEMP/smoke.sh"
+        printf '%s\n' "$SMOKE" > "$TMPDIR_POSIX/smoke.sh"
+        bash -euo pipefail "$TMPDIR_POSIX/smoke.sh"
