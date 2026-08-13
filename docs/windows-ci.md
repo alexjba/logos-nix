@@ -327,27 +327,23 @@ It does **not** work for a module repo that rebuilds `packages` over its own
 hardcoded `systems` list (logos-storage-module, logos-chat-module,
 logos-test-modules, the Rust/Nim ones) — those need real work.
 
-`windows-fleet-audit.yml` runs weekly and fails when a repo gains a Windows
-target and nobody added the caller.
+A **fleet audit** — a scheduled job that fails when a repo gains a Windows
+target and nobody adds the caller — is deliberately NOT in this change. It was
+written, and taken back out, because it cannot be sized honestly yet:
 
-### The audit has three outcomes, and "unknown" is a failure
+* the org has **202 unarchived repos**, not the ~60 the design assumed. 106 of
+  them carry a flake, each needing a `nix eval` with a 180 s ceiling — the job
+  would be cancelled mid-loop by its own 60-minute timeout, producing no
+  summary, no buckets and no error.
+* corroborating a 404 against the repo's contents root — the fix for a token
+  that can list repos but not read them — files an **empty repository** as
+  unreadable. Measured: 7 of the org's no-flake repos 404 on contents root
+  because they have no commits, so the audit would sit permanently red on a
+  false statement.
 
-Every listed repo lands in exactly one bucket, and the job asserts the buckets
-add up to the repos listed. Alongside *covered* and *drift* there is **NOT
-AUDITED**: a repo whose flake fails to evaluate, whose eval times out, or whose
-contents probe returns anything other than 200 or 404. Those fail the job.
-
-This is not defensive padding. The first version ran `set -uo pipefail` without
-`-e`, so a failed `gh api` left an empty repo list, the loop body never ran, and
-the job exited **0** having audited **nothing** — reproduced with a `gh` that
-returns HTTP 403: `candidate repos: 0`, green. The same version filed every
-non-zero `nix eval` under "no Windows target", so a repo whose flake was broken
-and one whose eval hung were both reported as out of scope, and a repo whose
-probe was rate-limited mid-loop vanished from all three buckets while the job
-stayed green. A job that passes by skipping is worse than no job.
-
-There is also a floor on the listing itself: fewer than 20 repos is treated as a
-degraded API call, not a smaller org.
+Both are solvable; neither is solvable by guessing. It belongs in its own change,
+sized against 202 repos, once the per-repo callers exist and there is something
+to drift *from*.
 
 ### 404 is not an authoritative answer
 
@@ -389,8 +385,7 @@ same string the callers use.
 
 That rule is about the *reusable workflow* only, and the distinction is easy to
 "fix" in the wrong direction. logos-nix's own workflows —
-`windows-cache-prime.yml` (3 sites), `windows-fleet-audit.yml` (1) and
-`lint-ci.yml` (1) — run in **this** repo's checkout, where
+`windows-cache-prime.yml` (3 sites) and `lint-ci.yml` (1) — run in **this** repo's checkout, where
 `uses: ./.github/actions/nix-setup` resolves correctly and pins nothing to a tag
 that may not exist yet. They are right as they are. Only a workflow that is
 `uses:`-ed *by another repo* has to spell its siblings absolutely, because that
