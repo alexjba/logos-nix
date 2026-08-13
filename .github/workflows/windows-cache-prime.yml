@@ -1,7 +1,22 @@
 name: Windows cache prime
 
-# Fills logos-co.cachix.org with the shared mingw closure that every Windows CI
-# job depends on. THIS IS A PREREQUISITE, NOT AN OPTIMISATION.
+# Fills the shared Logos binary cache with the mingw closure that every Windows
+# CI job depends on. THIS IS A PREREQUISITE, NOT AN OPTIMISATION.
+#
+# WHY THIS FILE IS STILL IN logos-nix when the rest of the Windows CI harness
+# moved to logos-co/logos-windows-ci: it is the one piece genuinely bound to the
+# OVERLAY rather than to the harness. Its `push: paths:` trigger below watches
+# `flake.lock` and `nix/windows/**` -- this repo's own files -- and no external
+# repo can express that. The builds it runs are one-token flakerefs and would
+# move happily; the trigger is what cannot.
+#
+# The cache itself is now the org's self-hosted Attic (cache.nix.logos.co, per
+# status-im/infra-ci#263) rather than a cachix cache of our own, reached through
+# logos-windows-ci's nix-setup. The 404 measurements below were taken against
+# logos-co.cachix.org and have NOT been re-run against Attic -- treat the
+# specific store paths as illustrative of the shape of the problem (nixpkgs'
+# Hydra does not build cross Qt, so nobody upstream fills it) rather than as
+# current facts about what the Attic cache holds.
 #
 # THE MEASUREMENT THAT MAKES IT ONE
 #   The mingw *toolchain* substitutes from cache.nixos.org (200 on
@@ -9,7 +24,8 @@ name: Windows cache prime
 #   either cache: qtbase, qtdeclarative, qtsvg and qtremoteobjects at 6.11.1,
 #   plus icu4c 76.1 and boost 1.89.0, were all probed 404 on BOTH
 #   logos-co.cachix.org and cache.nixos.org. nixpkgs' Hydra does not build cross
-#   Qt, so nobody upstream will ever fill it for us.
+#   Qt, so nobody upstream will ever fill it for us. (Those probes predate the
+#   move to Attic and were NOT re-run against it -- see the note above.)
 #
 #   Consequence: without priming, EVERY Windows job in EVERY repo builds that
 #   stack from source, concurrently, and none of them can help each other
@@ -30,13 +46,16 @@ name: Windows cache prime
 #   out, CI cannot prime this cache and a human must seed it once from a real
 #   x86_64-linux machine:
 #       nix build github:logos-co/logos-nix#legacyPackages.x86_64-linux.pkgsWindows.qt6.qtbase
-#       nix path-info -r ./result | cachix push logos-co
+#       attic login logos https://cache.nix.logos.co <token>
+#       attic push logos:public ./result
+#   (the attic invocation is written from its documented interface and has NOT
+#   been run here; the cachix form it replaces had not been run either.)
 #   after which this workflow keeps it warm and the manual step never recurs.
 
 on:
   workflow_dispatch:
   schedule:
-    # Weekly, to re-fill after cachix GC and after a nixpkgs-windows bump.
+    # Weekly, to re-fill after cache GC and after a nixpkgs-windows bump.
     - cron: '0 3 * * 1'
   push:
     branches: [master]
@@ -55,9 +74,10 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/nix-setup
+      - uses: logos-co/logos-windows-ci/.github/actions/nix-setup@v1
         with:
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          attic-token-ci: ${{ secrets.ATTIC_TOKEN_CI }}
+          attic-token-public: ${{ secrets.ATTIC_TOKEN_PUBLIC }}
           github-token: ${{ github.token }}
           free-disk-space: 'true'
       - run: |
@@ -72,9 +92,10 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/nix-setup
+      - uses: logos-co/logos-windows-ci/.github/actions/nix-setup@v1
         with:
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          attic-token-ci: ${{ secrets.ATTIC_TOKEN_CI }}
+          attic-token-public: ${{ secrets.ATTIC_TOKEN_PUBLIC }}
           github-token: ${{ github.token }}
           free-disk-space: 'true'
       - run: |
@@ -90,9 +111,10 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/nix-setup
+      - uses: logos-co/logos-windows-ci/.github/actions/nix-setup@v1
         with:
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          attic-token-ci: ${{ secrets.ATTIC_TOKEN_CI }}
+          attic-token-public: ${{ secrets.ATTIC_TOKEN_PUBLIC }}
           github-token: ${{ github.token }}
           free-disk-space: 'true'
       - name: Build the two closures that between them cover everything else
@@ -110,7 +132,16 @@ jobs:
           set -euo pipefail
           # Probe the cache for the paths we just pushed. A green build that
           # pushed nothing looks identical to one that pushed everything, right
-          # up until the next job rebuilds Qt from source, so ask cachix.
+          # up until the next job rebuilds Qt from source, so ask the cache.
+          #
+          # Attic, not cachix: nix-setup pushes to cache.nix.logos.co now, and a
+          # probe left pointing at logos-co.cachix.org would fail EVERY run
+          # against a cache nothing writes to any more. The `public` cache is
+          # the one this workflow fills, because it only runs on master /
+          # schedule / dispatch and the org action selects `public` there.
+          # URL shape verified against the live endpoint: /public/<hash>.narinfo
+          # returns 404 for an absent well-formed hash (and /public/nix-cache-info
+          # returns 200), so a non-200 here means absent rather than misaddressed.
           ATTRS=(
             'github:logos-co/logos-logoscore-cli#packages.x86_64-windows.cli'
             'github:logos-co/logos-liblogos#packages.x86_64-windows.portable'
@@ -121,14 +152,18 @@ jobs:
             for a in "${ATTRS[@]}"; do
               p=$(nix eval --raw "$a.outPath")
               h=$(basename "$p" | cut -d- -f1)
-              code=$(curl -s -o /dev/null -w '%{http_code}' "https://logos-co.cachix.org/$h.narinfo")
+              code=$(curl -s -o /dev/null -w '%{http_code}' \
+                       "https://cache.nix.logos.co/public/$h.narinfo")
               echo "- \`$a\` → HTTP $code"
               [ "$code" = 200 ] || miss=1
             done
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$miss" -ne 0 ]; then
-            echo "::error::a path this job built is NOT in logos-co.cachix.org."
-            echo "::error::The push failed or the token is read-only — priming did not happen,"
-            echo "::error::and every Windows job will still start from source."
+            echo "::error::a path this job built is NOT in the Logos public cache."
+            echo "::error::The push failed or ATTIC_TOKEN_PUBLIC is absent — priming did not"
+            echo "::error::happen, and every Windows job will still start from source."
+            echo "::error::On master that secret lives in the public-cache environment; a job"
+            echo "::error::that does not enter it resolves the token to empty and SKIPS the"
+            echo "::error::push rather than failing, which is exactly this symptom."
             exit 1
           fi
