@@ -56,8 +56,10 @@ on:
           directory per target, so every path starts with a target name:
           `run lgx/bin/lgx.exe --help`, NOT `run bin/lgx.exe --help`.
           Invoke PEs through the `run` wrapper on PATH -- it is wine on Linux
-          and a direct exec on Windows, so ONE script serves both legs, and it
-          turns the three silent Windows launch failures into named errors.
+          and a direct exec on Windows, so ONE script serves both legs. It
+          refuses a path that does not exist and a command that exits 0 having
+          printed nothing, and on any failure reports the exit code, both of
+          the program's streams, and what shipped beside the binary.
           `$STAGE_ABS` is the tree root spelled the way the PE will see it (a
           `Z:` path under wine, a drive path on Windows). Empty means
           COMPILE-ONLY -- allowed, but reported as a coverage gap, not a pass.

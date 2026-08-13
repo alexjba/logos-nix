@@ -56,7 +56,8 @@ Windows 11 box against a real staged tree, a wrong path now produces:
 ```
 
 and exit **1**, not 127 — the distinction matters, because 127 is also what a
-missing DLL looks like from an MSYS parent.
+program that fails to start reports under the same shell. The existence check
+is what separates the two; it reports a fact ("no such file"), not a cause.
 
 ## What a repo adds
 
@@ -71,78 +72,63 @@ jobs:
     with:
       targets: lgx
       smoke: |
-        run lgx/bin/lgx.exe --help | grep -qi usage
+        run lgx/bin/lgx.exe --help | tee help.txt
+        grep -qi usage help.txt
 ```
 
-## `run`, and the three silent failures it names
+Not `run … | grep -qi usage`: that is the SIGPIPE shape this repo's own lint
+rule (3) forbids, and `lint-actions.sh` now checks `smoke:` blocks as well as
+`run:` blocks, so it is caught in the template and in any caller that copies it.
+`grep -q` also eats the wrapper's stdout — the diagnostics survive because they
+go to stderr, but the program's own output does not.
+
+## `run`, and what it does and does not claim
 
 Every PE is launched through a `run` wrapper on `PATH` — wine on the Linux leg,
-a direct exec on the Windows leg, so one script serves both. It exists because
-**every way a staged Windows binary fails to start is silent**, and two of them
-are indistinguishable by exit code. Measured against `lgx.exe` with exactly one
-DLL removed from an otherwise-working tree:
+a direct exec on the Windows leg, so one script serves both. What it adds over
+`exec "$@"` is deliberately small:
 
-| launcher | intact | missing DLL | missing path |
-|---|---|---|---|
-| Windows, non-bash parent | `0`, output | **`-1073741515`** (0xC0000135), stdout **and** stderr empty | n/a |
-| Windows, Git-Bash/MSYS parent (the CI leg) | `0`, output | `127`, stdout empty, stderr names **a** dependency — **not reliably the missing one** | `127`, "No such file or directory" |
-| wine 11.0 on Linux | `0`, output | `53` (`0xC0000135 & 0xFF`), stdout **and** stderr empty | `53` + "wine: failed to open" |
+* it **checks the PE exists before launching it**. Without that check a missing
+  path and a program that failed to start arrive as the same status (`127` under
+  bash, `53` under wine) and neither says which happened. The check reports a
+  fact — `no such file: X` — and lists the staged target directories;
+* on **any** non-zero exit it reports the exit code, the program's stdout
+  verbatim, its stderr verbatim, and a listing of what actually shipped beside
+  the binary. Nothing else. The listing is the one diagnostic here that has
+  never been wrong, because it reports the tree rather than interpreting it;
+* it treats **exit 0 with no output at all** as a failure. Silent success is
+  this project's dominant defect class — an install rule that copied nothing, a
+  package that labelled itself linux-amd64, a plugin shipped without its DLLs, a
+  reply never sent; every one of them exited 0. `run -q` opts out, for a command
+  that is legitimately silent. That is a contract with the caller, not a
+  diagnosis;
+* it writes **every one of its own diagnostics to stderr**, and reproduces the
+  program's stdout there too on failure. The documented idiom pipes the wrapper
+  (`run … | grep -qi usage`), and `grep -q` eats stdout; measured on Windows 11
+  against a real failing PE, a report written to stdout reached the log as one
+  raw line and nothing else. The program's own stdout still goes to stdout, so
+  `| grep` keeps working.
 
-### What that MSYS stderr line actually names
+### What it used to claim, and why that is gone
 
-An earlier revision of this table, and of `run`'s own header, said it names
-`libgcc_s_seh-1.dll` "every time, whichever DLL was actually removed". **That is
-false.** Re-measured on Windows 11 (26200) under MSYS bash 5.3.15, against a
-real cross-built `lgpm.exe` and its 26 shipped DLLs, removing each DLL in turn
-from an otherwise-working tree:
+Earlier revisions read a cause out of the exit code and out of whichever DLL
+name happened to appear on stderr: an exit-code case analysis, a named Windows
+status condition, and a characterisation of which DLL each shell reports when a
+load fails. **Three successive versions of that last claim were made and each
+failed to reproduce when re-measured** — a first sweeping form, a corrected
+narrower one, and a re-measured distribution. The behaviour is not stable enough
+to characterise, and every attempt printed a confident false sentence into the
+log of whoever hit it.
 
-| outcome | count | the DLL the stderr line named |
-|---|---|---|
-| load broke (`127`, stdout empty) | **9 of 26** | 7 named `api-ms-win-crt-string-l1-1-0.dll` — a **system** DLL that was present the whole time; 2 named the DLL actually removed (`libgcc_s_seh-1.dll`, `libpackage_manager_lib.dll`) |
-| no failure at all (`0`, full output) | **17 of 26** | — those DLLs are not on the `--help` path's load-time closure |
+So the wrapper no longer says what a missing DLL is, which DLL the loader named,
+or what any exit code means beyond what the program itself reported. The one
+orienting sentence it still prints is that a non-zero exit with nothing on
+stdout is *consistent with* the process having failed before `main()` — stated
+without naming a cause, and explicitly without claiming it did.
 
-So the true and still-useful statement is narrower: **the name in that line is
-evidence that this *is* a loader failure, and is not the identity of the missing
-file.** `run` uses it only for the former, and now says so. The "libgcc every
-time" belief looks like one sample generalised — removing `libgcc_s_seh-1.dll`
-is in fact one of the two cases where the name happens to be right.
-
-So `run`:
-
-* checks the PE exists **before** launching it, which is the only thing that
-  separates "wrong path" from "missing DLL" on either leg;
-* treats `53`/`127` **with empty stdout** as STATUS_DLL_NOT_FOUND and says so,
-  listing what actually shipped beside the binary — but only when stderr
-  corroborates it, i.e. stderr is empty (the wine shape) or names a DLL (the
-  MSYS shape). A program that exits 53 or 127 and explains itself on stderr
-  gets its own message and its own exit code, because eight confident lines
-  about a missing DLL aimed at an unrelated failure is worse than silence.
-  Measured on Windows 11 with a real PE exiting 53 with only a stderr line: the
-  pre-corroboration version answered with the DLL story **and** listed all of
-  `C:\Windows\System32` — 18,941 lines — as "shipped beside it";
-* lists only `53` and `127`. Bash masks a child's status to 0–255, so the raw
-  `3221225781` / `-1073741515` spellings of 0xC0000135 can never appear in `$?`;
-  they were dead branches;
-* treats **exit 0 with no output at all** as a failure. Silent success is this
-  project's dominant defect class; a smoke test that cannot tell "it worked"
-  from "it did nothing" is not coverage. Use `run -q` for a command that is
-  genuinely silent;
-* honours `-q` in the **`53`/`127`** branch too, not only in the exit-0 one.
-  The loader diagnosis rests entirely on "stdout was empty and that is
-  abnormal". For a command the caller has declared legitimately silent, empty
-  stdout is evidence of nothing, so `run -q` reports the failure and its exit
-  code but explicitly does **not** assert STATUS_DLL_NOT_FOUND. Measured on
-  Windows 11 against a real 127: without `-q`, 39 `::error::` lines including
-  the full diagnosis; with `-q`, the failure is reported and the DLL story is
-  not;
-* writes **every one of its own diagnostics to stderr**. The program's stdout
-  stays on stdout, so `run … | grep` still works — but the wrapper's whole
-  reason for existing now survives being piped. Measured on Windows 11 with a
-  real missing-DLL failure: through `run … | grep -qi usage`, the shipped
-  version delivered **0** of its `::error::` lines to the log (`grep -q` ate
-  them all, leaving only the raw MSYS line the table above says is unreliable);
-  the current version delivers all **39**. GitHub parses `::error::` on stderr
-  as well as stdout, so this costs nothing.
+The bar this is held to: on a real missing-DLL failure the log carries the exit
+code, both streams, and the tree — enough for a maintainer to diagnose it —
+without telling them anything that might be false.
 
 ## No `producer | grep -q` anywhere, and a lint that keeps it that way
 
@@ -313,9 +299,17 @@ from the log. wine is what decides whether every PE in a repo "starts", so an
 unpinned wine is an unpinned verdict. It now resolves from logos-nix's own
 `flake.lock` via `path:$GITHUB_ACTION_PATH/../../..#legacyPackages.x86_64-linux.wine64Packages.minimal`
 (verified against this repo's pin: `wine64-10.0`), and the action asserts wine
-can report its own version before running anything — a launcher that cannot
-start makes *every* binary look like a `0xC0000135` loader failure and blames the
-artifact.
+can report its own version **before any smoke runs** — a launcher that cannot
+start makes every binary in the tree fail identically, and the failure would be
+reported against the artifact.
+
+The launcher inside that store path is `wine64`, **not** `wine`. An earlier
+revision hardcoded `$out/bin/wine`, which does not exist there, so the wine leg
+could not pass for any caller. Listed from the real path this repo's pin
+resolves to (`…-wine64-10.0/bin`): `wine64`, `wine64-preloader`, `wineserver`,
+`winedbg`, … and no `wine`. The action now probes for `wine64` then `wine` and
+fails naming the directory contents if neither is there, because a hardcoded
+name is what broke it the first time.
 
 ## What a repo with no Windows target does
 

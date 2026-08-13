@@ -178,7 +178,18 @@ runs:
             if ! members=$(ar t "$a" 2>&1); then
               echo "::error::cannot list $a: $(printf '%s\n' "$members" | sed -n '1,5p')"; bad=1; continue
             fi
-            m=$(printf '%s\n' "$members" | grep -E '\.(o|obj)$' | sed -n '1p')
+            # `grep` returning 1 on NO MATCH is a NORMAL outcome here -- it is
+            # exactly the case the `[ -z "$m" ]` branch below exists to report.
+            # Removing the old `|| true` was right for the SIGPIPE class, but it
+            # also let that 1 reach `set -e` through the assignment, so the gate
+            # aborted having named no archive and no reason. Capture the status
+            # instead and split the two: 1 = no match (reported below), >1 =
+            # grep itself failed, which is a read error and gets its own line.
+            mrc=0
+            m=$(printf '%s\n' "$members" | grep -E '\.(o|obj)$' | sed -n '1p') || mrc=$?
+            if [ "$mrc" -gt 1 ]; then
+              echo "::error::listing the members of $a failed: grep exited $mrc"; bad=1; continue
+            fi
             if [ -z "$m" ]; then
               echo "::error::$a contains no .o/.obj members: $(printf '%s\n' "$members" | sed -n '1,5p')"; bad=1; continue
             fi

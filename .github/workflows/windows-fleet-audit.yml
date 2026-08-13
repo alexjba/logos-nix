@@ -115,6 +115,24 @@ jobs:
           # Run at BOTH ends of the loop: a token that degrades halfway through
           # turns every remaining repo into a silent "no flake", which is the
           # same failure over fewer repos and just as green.
+          #
+          # THE CANARY ONLY CATCHES TOTAL BLINDNESS, AND SO DID THE RULE BEHIND
+          # IT. Measured on the previous revision with a stubbed `gh` in which
+          # only the canary repo's contents were visible and every other repo's
+          # contents probe returned 404: 24 of 25 repos were filed "no flake --
+          # nothing to evaluate", BOTH canary probes read 200/404 correctly, the
+          # bucket accounting reconciled, and the job EXITED 0 reporting a
+          # covered fleet. The corroborating rule was `n_noflake == n_repos`,
+          # which cannot fire while the canary repo itself is visible. A
+          # partially blind token -- one repo private to this token, one
+          # fine-grained grant that lapsed -- is the realistic shape; a total
+          # outage is not.
+          #
+          # So corroborate PER REPO, not fleet-wide: every 404 on flake.nix is
+          # re-probed against that repo's contents ROOT, which exists for any
+          # non-empty repo the token can read. 404 there means "this token
+          # cannot read this repo's contents", which is an UNKNOWN answer and
+          # belongs in NOT AUDITED, not in a bucket that passes.
           # -----------------------------------------------------------------
           CANARY_REPO=logos-nix
           canary() {
@@ -143,7 +161,18 @@ jobs:
             code=$(http_status "repos/logos-co/$r/contents/flake.nix")
             case "$code" in
               200) ;;
-              404) echo "$r" >> noflake.txt; continue ;;
+              404)
+                # Per-repo corroboration. See the block above: a 404 here is
+                # "no flake.nix" ONLY if this token can read this repo's
+                # contents at all. The root listing is the cheapest thing that
+                # must be 200 when it can.
+                root=$(http_status "repos/logos-co/$r/contents")
+                if [ "$root" = 200 ]; then
+                  echo "$r" >> noflake.txt
+                else
+                  echo "$r — flake.nix read 404 but so did the repo's contents root (HTTP ${root:-<no status line>}), so this token cannot read this repo; not audited" >> broken.txt
+                fi
+                continue ;;
               *)   echo "$r — flake.nix probe returned HTTP ${code:-<no status line>}" >> broken.txt
                    continue ;;
             esac
@@ -217,15 +246,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           rc=$canary_rc
-          # Belt and braces behind the canary. logos-co is a Nix workspace: a
-          # result in which NOTHING has a flake is not a finding about the org,
-          # it is a finding about the probe.
-          if [ "$n_noflake" -eq "$n_repos" ] && [ "$n_repos" -gt 0 ]; then
-            echo "::error::all $n_repos repos classified 'no flake — nothing to evaluate'."
-            echo "::error::Every repo in this org is a flake. That is a degraded contents probe,"
-            echo "::error::not a fleet without flakes, and it would have exited 0."
-            rc=1
-          fi
+          # The `n_noflake == n_repos` rule that used to sit here is GONE, not
+          # relaxed. It was unreachable once every 404 is corroborated per repo:
+          # a repo this token cannot read now lands in NOT AUDITED rather than
+          # in noflake, so noflake can only hold repos whose contents root read
+          # 200 and genuinely lacked a flake.nix. Leaving a rule that can no
+          # longer fire would be a check that measures nothing.
           if [ "$total" -ne "$n_repos" ]; then
             echo "::error::bucket accounting: $total classified vs $n_repos listed."
             echo "::error::A repo left the loop without being filed anywhere, so this audit"

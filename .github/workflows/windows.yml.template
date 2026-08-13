@@ -36,10 +36,11 @@ jobs:
       #     run bin/YOUR_TOOL.exe --version             <- `stage/bin` does not exist
       #
       # `run` is a wrapper on PATH: wine on Linux, a direct exec on Windows, so
-      # one script serves both legs. It also refuses three silent outcomes --
-      # a path that does not exist, a 0xC0000135 launch failure (which prints
-      # NOTHING, on either leg), and a command that exits 0 having produced no
-      # output at all. For a command that is legitimately silent, use `run -q`.
+      # one script serves both legs. It refuses a path that does not exist, and
+      # refuses a command that exits 0 having produced no output at all. On any
+      # failure it reports the exit code, both of the program's streams, and a
+      # listing of what shipped beside the binary -- and nothing beyond that.
+      # For a command that is legitimately silent, use `run -q`.
       #
       # `$STAGE_ABS` is the tree root as the PE sees it (a Z: path under wine).
       #

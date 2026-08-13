@@ -195,8 +195,27 @@ runs:
           fi
           outs=$(nix build --no-link --no-write-lock-file --print-out-paths \
                    "path:$ROOT#legacyPackages.x86_64-linux.wine64Packages.minimal")
-          RUN_EXEC="${outs%%$'\n'*}/bin/wine"
-          [ -x "$RUN_EXEC" ] || { echo "::error::no wine at $RUN_EXEC"; exit 1; }
+          WINE_OUT="${outs%%$'\n'*}"
+          # The launcher is `wine64`, NOT `wine`. An earlier revision hardcoded
+          # `$out/bin/wine`, which does not exist in this derivation, so the
+          # wine leg could not pass for any caller. Listed from the real store
+          # path this repo's own pin resolves to
+          # (9rfjybw218055dzmxvmamh63297mbvjn-wine64-10.0/bin): wine64,
+          # wine64-preloader, wineserver, winedbg, ... and no `wine`.
+          # Probed rather than re-hardcoded: nixpkgs has moved this name before
+          # (wow64 builds ship `wine` and no `wine64`), and a hardcoded name is
+          # what broke it the first time.
+          RUN_EXEC=
+          for c in wine64 wine; do
+            if [ -x "$WINE_OUT/bin/$c" ]; then RUN_EXEC="$WINE_OUT/bin/$c"; break; fi
+          done
+          if [ -z "$RUN_EXEC" ]; then
+            echo "::error::no wine launcher in $WINE_OUT/bin (looked for wine64, wine)."
+            echo "::error::Contents:"
+            find "$WINE_OUT/bin" -maxdepth 1 \( -type f -o -type l \) \
+              | sed 's|.*/|::error::  |'
+            exit 1
+          fi
           export RUN_EXEC
           export WINEPREFIX="$TMPDIR_POSIX/wineprefix" WINEDEBUG=-all
           export WINEDLLOVERRIDES="mscoree,mshtml="
@@ -214,16 +233,18 @@ runs:
           # a 0664 lgx.exe ran fine under wine. An inert line with a false
           # comment is worse than no line: it is a load-bearing-looking step
           # that would go on being copied.
-          # Positive control on the launcher, for the same reason the gates
-          # action proves its objdump can read PEs before trusting it. A wine
-          # that cannot start AT ALL makes every PE in the tree look like a
-          # 0xC0000135 loader failure -- `run` would print its eight-line
-          # missing-DLL story once per binary and blame the artifact.
+
+          # Positive control on the launcher, BEFORE any smoke runs, for the
+          # same reason the gates action proves its objdump can read PEs before
+          # trusting it. A launcher that cannot start makes every PE in the tree
+          # fail identically, and `run` would report each one -- exit code,
+          # empty streams, the shipped tree -- as if the artifact were at fault.
           if ! wver=$("$RUN_EXEC" --version 2>&1); then
             echo "::error::$RUN_EXEC cannot even report its version:"
             printf '%s\n' "$wver" | sed -n '1,10p'
-            echo "::error::Every PE would now be reported as a missing-DLL failure. Refusing"
-            echo "::error::to run the smoke script with a launcher that does not work."
+            echo "::error::Every PE in the tree would now fail, and the failure would be"
+            echo "::error::reported against the artifact. Refusing to run the smoke script"
+            echo "::error::with a launcher that does not work."
             exit 1
           fi
           echo "wine: $RUN_EXEC ($(printf '%s\n' "$wver" | sed -n '1p'))"
