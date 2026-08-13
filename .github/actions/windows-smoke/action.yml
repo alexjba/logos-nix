@@ -16,7 +16,25 @@ inputs:
       bash script, run from the staged tree ROOT. The root holds one directory
       per target, so every path begins with the target name --
       `run lgx/bin/lgx.exe --help`, not `run bin/lgx.exe --help`.
-    required: true
+      Empty when `smoke-file` is used instead.
+    required: false
+    default: ''
+  smoke-file:
+    description: >
+      Path, relative to `caller-dir`, of a committed script to run instead of
+      the inline `smoke` string. Same cwd, same `run` wrapper, same
+      `$STAGE_ABS` -- only the delivery differs. Exactly one of `smoke` /
+      `smoke-file` must be non-empty; the caller workflow rejects both-or-
+      neither before any build starts, and this action re-checks because an
+      action can be used directly.
+    required: false
+    default: ''
+  caller-dir:
+    description: >
+      Directory the caller's repo was checked out into, relative to the
+      workspace. Only read when `smoke-file` is set.
+    required: false
+    default: caller
   stage-dir:
     description: Directory the artifact was downloaded into.
     required: false
@@ -128,6 +146,8 @@ runs:
       env:
         # Via env, never interpolated into the script text. See the description.
         SMOKE: ${{ inputs.smoke }}
+        SMOKE_FILE: ${{ inputs.smoke-file }}
+        CALLER_DIR: ${{ inputs.caller-dir }}
         WINE: ${{ inputs.wine }}
       run: |
         set -euo pipefail
@@ -269,5 +289,59 @@ runs:
         echo "cwd=$(pwd)  STAGE_ABS=$STAGE_ABS  RUN_EXEC=${RUN_EXEC:-<direct exec>}"
         echo "staged targets: $(find . -mindepth 1 -maxdepth 1 -type d | sed 's|^\./||' | sort | tr '\n' ' ')"
 
-        printf '%s\n' "$SMOKE" > "$TMPDIR_POSIX/smoke.sh"
-        bash -euo pipefail "$TMPDIR_POSIX/smoke.sh"
+        # Resolve WHICH script to run, and refuse the two ambiguous states. The
+        # caller workflow already rejects both-or-neither before the build, but
+        # this action is usable on its own, and "neither" is the dangerous one:
+        # it would run an empty file, exit 0, and be reported as a smoke pass.
+        if [ -n "$SMOKE" ] && [ -n "${SMOKE_FILE:-}" ]; then
+          echo "::error::both 'smoke' and 'smoke-file' were given to this action."
+          echo "::error::They are two deliveries of the same script; one would be"
+          echo "::error::silently ignored. Pass exactly one."
+          exit 1
+        fi
+        if [ -z "$SMOKE" ] && [ -z "${SMOKE_FILE:-}" ]; then
+          echo "::error::neither 'smoke' nor 'smoke-file' was given, so there is no"
+          echo "::error::script to run. This action does not treat 'nothing to do' as"
+          echo "::error::a pass -- gate the JOB on the input instead, the way"
+          echo "::error::windows-ci.yml does, so a compile-only run is visibly a"
+          echo "::error::compile-only run rather than a green smoke leg."
+          exit 1
+        fi
+
+        if [ -n "${SMOKE_FILE:-}" ]; then
+          # cwd is the staged tree; $CALLER_DIR is relative to the WORKSPACE, so
+          # resolve from $GITHUB_WORKSPACE rather than from here. Spelled by
+          # bash via `cd && pwd` for the same reason $RUNNER_TEMP is above: on
+          # the native leg $GITHUB_WORKSPACE is a drive path, and pasting one
+          # into a POSIX context does not mean what it looks like it means.
+          if ! WS=$(cd "$GITHUB_WORKSPACE" && pwd) || [ -z "$WS" ]; then
+            echo "::error::could not resolve \$GITHUB_WORKSPACE ('${GITHUB_WORKSPACE:-<unset>}')."
+            exit 1
+          fi
+          SCRIPT="$WS/$CALLER_DIR/$SMOKE_FILE"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::error::smoke-file not found: $SCRIPT"
+            echo "::error::smoke-file is relative to the caller checkout ('$CALLER_DIR'),"
+            echo "::error::NOT to the staged tree. If '$CALLER_DIR' is missing entirely,"
+            echo "::error::the job did not check the caller out -- that checkout is"
+            echo "::error::conditional on smoke-file being set."
+            echo "::error::workspace contents:"
+            find "$WS" -mindepth 1 -maxdepth 2 -not -path '*/.git/*' \
+              | sed "s|^$WS/|::error::  |" | sed -n '1,40p'
+            exit 1
+          fi
+          # An empty file satisfies -f, runs, asserts nothing and exits 0 -- a
+          # green smoke leg that tested nothing. Same refusal the caller
+          # workflow makes; repeated because this action is usable on its own.
+          if [ ! -s "$SCRIPT" ]; then
+            echo "::error::smoke-file is empty: $CALLER_DIR/$SMOKE_FILE"
+            echo "::error::An empty script exits 0 having asserted nothing, and would"
+            echo "::error::be reported as a smoke pass."
+            exit 1
+          fi
+          echo "smoke-file: $CALLER_DIR/$SMOKE_FILE"
+          bash -euo pipefail "$SCRIPT"
+        else
+          printf '%s\n' "$SMOKE" > "$TMPDIR_POSIX/smoke.sh"
+          bash -euo pipefail "$TMPDIR_POSIX/smoke.sh"
+        fi

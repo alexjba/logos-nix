@@ -82,6 +82,45 @@ rule (3) forbids, and `lint-actions.sh` now checks `smoke:` blocks as well as
 `grep -q` also eats the wrapper's stdout — the diagnostics survive because they
 go to stderr, but the program's own output does not.
 
+### `smoke-file`, for anything longer than a few lines
+
+```yaml
+    with:
+      targets: lgx
+      smoke-file: .github/smoke/lgx-cli.sh
+```
+
+Same contract as `smoke` — same cwd, same `run` wrapper, same `$STAGE_ABS` —
+and mutually exclusive with it; setting both is refused before the build starts,
+because one of them would otherwise be silently ignored and a reader of the
+caller could not tell which.
+
+Two things a file buys that an inline block cannot:
+
+* **It is linted.** An inline `smoke:` is invisible to shellcheck — `actionlint`
+  substitutes a placeholder for `${{ }}` before handing a script over, which is
+  the same blind spot that let `[ -z "${{ inputs.smoke }}" ]` ship. A committed
+  script is linted by the caller's own CI like any other file.
+* **It runs by hand.** `.github/smoke/lgx-cli.sh` is written so `LGX` defaults to
+  the `.exe` but can be overridden, so the identical file runs against a native
+  build during development. That is how you discover an assertion that never
+  bites — `logos-package`'s script was first written against `master`'s `lgx`
+  and asserted manifest schema `0.3.0`; the branch it landed on had bumped it to
+  `0.4.0`, and only re-running it against that branch's own binary caught it.
+
+Setting `smoke-file` is also what makes the smoke jobs **check the caller out**.
+They otherwise only download the artifact — `$GITHUB_WORKSPACE` on those runners
+holds nothing but `stage/` — so a caller-side path is unreachable without it.
+The checkout lands in `caller/` and runs before the download, so it cannot
+interact with the staged tree in either order.
+
+The path is validated in `cross-build`, which already has the repo checked out:
+a mistyped path fails there, in seconds, naming every `.sh` in the repo — rather
+than ten minutes later on the Windows leg, where the message would be about
+staged trees and read as a path-contract mistake. An **empty** file is refused
+too, at both layers: it satisfies `-f`, runs, asserts nothing, exits 0, and is
+otherwise indistinguishable from a smoke test that passed.
+
 ## `run`, and what it does and does not claim
 
 Every PE is launched through a `run` wrapper on `PATH` — wine on the Linux leg,

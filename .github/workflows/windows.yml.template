@@ -49,6 +49,20 @@ jobs:
       smoke: |
         run default/bin/YOUR_TOOL.exe --version
 
+      # ONCE THIS OUTGROWS A FEW LINES, MOVE IT TO A FILE and use `smoke-file`
+      # instead (the two are mutually exclusive and the workflow refuses both):
+      #
+      #     smoke-file: .github/smoke/YOUR_TOOL.sh
+      #
+      # Identical contract -- same cwd, same `run` wrapper, same `$STAGE_ABS`.
+      # What changes is that a committed file is LINTABLE and RUNNABLE:
+      #   * an inline block is invisible to shellcheck, because actionlint
+      #     substitutes a placeholder for `${{ }}` before linting it;
+      #   * a file can be executed by hand against a NATIVE build during
+      #     development, which is how you find out an assertion never bites.
+      # Setting it is also what makes the smoke jobs check this repo out --
+      # they otherwise only download the artifact.
+
       # ---- the knobs you will rarely touch --------------------------------
       # min-pes: 1            floor on staged loose .exe/.dll; a
       #                       headers+static-lib repo sets `min-pes: 0` AND

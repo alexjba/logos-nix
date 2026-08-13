@@ -66,6 +66,34 @@ on:
         type: string
         required: false
         default: ''
+      smoke-file:
+        description: >
+          Path, relative to the CALLER's repo root, of a committed bash script
+          to run instead of an inline `smoke:` string. Identical contract --
+          same cwd, same `run` wrapper, same `$STAGE_ABS`; only the delivery
+          differs. Mutually exclusive with `smoke`.
+
+          Prefer this once a smoke script outgrows a few lines. An inline block
+          is INVISIBLE TO SHELLCHECK -- actionlint replaces every expression
+          interpolation with a placeholder before linting, so nothing checks it
+          -- and it cannot be run by hand during development. A committed file
+          is lintable in the caller's own CI and executable locally against a
+          native build.
+
+          (That sentence deliberately does not spell the interpolation syntax
+          out. A literal empty one inside a YAML VALUE is itself parsed as an
+          expression, and an empty expression is a syntax error -- which is
+          exactly how the first draft of this description failed actionlint.
+          The `#` comments in this file may spell it: comments are not parsed.)
+
+          The smoke jobs download an artifact and do NOT otherwise check out the
+          caller, so setting this is what adds that checkout. It lands in a
+          SUBDIRECTORY (`caller/`) rather than the workspace root, so the
+          checkout can never interact with the downloaded `stage/` tree in
+          either order.
+        type: string
+        required: false
+        default: ''
       native-smoke:
         description: Run `smoke` on a real windows-latest runner. Free on public repos.
         type: boolean
@@ -148,6 +176,50 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: ${{ inputs.submodules }}
+
+      # ------------------------------------------------------------------
+      # Validate the smoke inputs HERE, in the job that has the caller's repo
+      # checked out, rather than on the smoke leg that actually uses them. A
+      # mistyped `smoke-file` otherwise surfaces after the whole cross-build --
+      # ten minutes and an artifact upload later -- as `no such file` from a
+      # wrapper whose message is about staged trees and target directories, and
+      # so reads as a path-contract mistake instead of a typo in this YAML.
+      #
+      # Via env, never interpolated into the script text: a caller string that
+      # reaches a shell through `${{ }}` is shell SOURCE. See the header.
+      # ------------------------------------------------------------------
+      - name: Validate the smoke inputs
+        shell: bash
+        env:
+          SMOKE: ${{ inputs.smoke }}
+          SMOKE_FILE: ${{ inputs.smoke-file }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SMOKE" ] && [ -n "$SMOKE_FILE" ]; then
+            echo "::error::both 'smoke' and 'smoke-file' are set. They are two ways to"
+            echo "::error::deliver the SAME script, so having both means one of them is"
+            echo "::error::silently ignored -- and which one is not something a reader of"
+            echo "::error::the caller could work out. Pick one."
+            exit 1
+          fi
+          if [ -n "$SMOKE_FILE" ]; then
+            if [ ! -f "$SMOKE_FILE" ]; then
+              echo "::error::smoke-file: $SMOKE_FILE does not exist in this repo."
+              echo "::error::The path is relative to the CALLER's repo root."
+              echo "::error::Shell scripts found here:"
+              find . -name '*.sh' -not -path './.git/*' | sed -n '1,30p' | sed 's|^|::error::  |'
+              exit 1
+            fi
+            # Not a warning about style: an empty file passes `-f`, produces no
+            # commands, exits 0, and is indistinguishable from a smoke test that
+            # ran and found nothing wrong.
+            if [ ! -s "$SMOKE_FILE" ]; then
+              echo "::error::smoke-file: $SMOKE_FILE is empty. An empty script exits 0"
+              echo "::error::having asserted nothing, which is reported as a pass."
+              exit 1
+            fi
+            echo "smoke-file: $SMOKE_FILE ($(wc -l < "$SMOKE_FILE" | tr -d '[:space:]') lines)"
+          fi
 
       - uses: logos-co/logos-nix/.github/actions/nix-setup@v1
         with:
@@ -371,10 +443,20 @@ jobs:
   # --------------------------------------------------------------------------
   wine-smoke:
     needs: cross-build
-    if: inputs.smoke != '' && inputs.wine-smoke
+    if: (inputs.smoke != '' || inputs.smoke-file != '') && inputs.wine-smoke
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # Checked out into `caller/`, and BEFORE the artifact download. Either one
+      # alone would do -- `path:` scopes checkout's clean to that subdirectory,
+      # and going first means there is nothing to clean anyway -- but the cost
+      # of both is zero and the cost of getting it wrong is a `stage/` tree that
+      # vanishes between two steps that each look correct in isolation.
+      - uses: actions/checkout@v4
+        if: inputs.smoke-file != ''
+        with:
+          path: caller
+          submodules: ${{ inputs.submodules }}
       - uses: actions/download-artifact@v4
         with:
           name: windows-x86_64-${{ github.event.repository.name }}
@@ -387,11 +469,13 @@ jobs:
         with:
           stage-dir: stage
           smoke: ${{ inputs.smoke }}
+          smoke-file: ${{ inputs.smoke-file }}
+          caller-dir: caller
           wine: 'true'
 
   native-smoke:
     needs: cross-build
-    if: inputs.smoke != '' && inputs.native-smoke
+    if: (inputs.smoke != '' || inputs.smoke-file != '') && inputs.native-smoke
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -402,6 +486,11 @@ jobs:
       # cross-built lgx.exe plus its seven DLLs, unpacked from a zip onto a
       # Windows 11 box with no toolchain and no runtime present, ran and printed
       # 988 bytes of help.
+      - uses: actions/checkout@v4
+        if: inputs.smoke-file != ''
+        with:
+          path: caller
+          submodules: ${{ inputs.submodules }}
       - uses: actions/download-artifact@v4
         with:
           name: windows-x86_64-${{ github.event.repository.name }}
@@ -410,4 +499,6 @@ jobs:
         with:
           stage-dir: stage
           smoke: ${{ inputs.smoke }}
+          smoke-file: ${{ inputs.smoke-file }}
+          caller-dir: caller
           wine: 'false'
