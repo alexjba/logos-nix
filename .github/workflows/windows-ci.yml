@@ -75,7 +75,11 @@ on:
         required: false
         default: true
       min-pes:
-        description: Floor on staged .exe/.dll count. 0 only with min-archives >= 1.
+        description: >
+          Floor on staged loose .exe/.dll count. 0 only together with
+          min-archives >= 1 (headers+static-lib repo) or lgx-variant: true (a
+          repo whose only Windows artifact is a .lgx — its PEs are gated inside
+          the archive, imports included).
         type: number
         required: false
         default: 1
@@ -85,7 +89,10 @@ on:
         required: false
         default: 0
       lgx-variant:
-        description: Assert each staged .lgx has a real variants/windows-x86_64 payload.
+        description: >
+          Assert each staged .lgx has a real variants/windows-x86_64 payload.
+          Counts as a floor in its own right, so it is the correct partner for
+          min-pes: 0 / min-archives: 0.
         type: boolean
         required: false
         default: false
@@ -273,14 +280,15 @@ jobs:
           EXTRA_GATES: ${{ inputs.extra-gates }}
         run: |
           set -euo pipefail
-          OBJDUMP=""
-          while read -r p; do
-            if [ -x "$p/bin/x86_64-w64-mingw32-objdump" ]; then
-              OBJDUMP="$p/bin/x86_64-w64-mingw32-objdump"; break
-            fi
-          done < <(nix build --no-link --print-out-paths \
-                     nixpkgs#pkgsCross.mingwW64.buildPackages.binutils)
-          [ -n "$OBJDUMP" ] || { echo "::error::no mingw objdump"; exit 1; }
+          # $OBJDUMP was resolved from logos-nix's OWN pin by the gates action a
+          # step ago, and proven to support pei-x86-64 there. Resolving a second
+          # one here is how the two copies drift; taking it from the floating
+          # `nixpkgs#` registry -- which is what this step used to do -- is how a
+          # gate ends up reading PEs with a binary nobody pinned.
+          if [ -z "${OBJDUMP:-}" ] || [ ! -x "${OBJDUMP:-}" ]; then
+            echo "::error::OBJDUMP is not set — the windows-gates action must run first."
+            exit 1
+          fi
           export OBJDUMP
           # Via env, never interpolated into shell source: a script containing a
           # single quote would otherwise terminate the quoting and execute

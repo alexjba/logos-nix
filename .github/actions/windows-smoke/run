@@ -58,26 +58,61 @@ fi
 rc=$?
 cat "$o"; cat "$e" >&2
 osz=$(wc -c < "$o"); esz=$(wc -c < "$e")
-rm -f "$o" "$e"
+# $e outlives the echo: the CONTENT of stderr, not just its size, is what
+# separates a loader failure from a program that failed and said why.
+rm -f "$o"
 
+# 53 and 127 only. bash masks a child's status to 0-255, so the raw Windows
+# spellings 3221225781 and -1073741515 CANNOT appear in $? -- they were listed
+# here and were dead branches. Both are 0xC0000135, and 0xC0000135 & 0xFF = 0x35
+# = 53, which is the wine leg's number; 127 is what an MSYS parent reports.
+#
+# Emptiness of stdout alone is NOT enough to call it a loader failure. A program
+# is entitled to exit 53 or 127 and explain itself on stderr, and answering that
+# with eight lines about STATUS_DLL_NOT_FOUND is a confident wrong diagnosis
+# aimed at the next person to read this log. So corroborate: a real 0xC0000135
+# says nothing at all (wine) or names a DLL (MSYS).
 case "$rc" in
-  53|127|3221225781|-1073741515)
+  53|127)
     if [ "$osz" -eq 0 ]; then
-      echo "::error::$pe exited $rc having printed nothing on stdout."
-      echo "::error::That is STATUS_DLL_NOT_FOUND (0xC0000135): the loader could not find a"
-      echo "::error::dependency, so the process died before main() and never got to say so."
-      echo "::error::Do not read the exit code as the whole story -- from a Git-Bash parent"
-      echo "::error::the accompanying 'error while loading shared libraries' line names an"
-      echo "::error::ARBITRARY dependency, not the missing one (measured)."
-      echo "::error::The import-closure gate should have caught this on the builder; if it"
-      echo "::error::did not, either the artifact lost a file in transit or the DLL is"
-      echo "::error::loaded at RUNTIME (LoadLibrary), which no import table records."
-      echo "::error::Shipped beside it:"
-      # shellcheck disable=SC2012  # these are DLL names, not arbitrary input
-      ls -1 "$(dirname "$pe")" | sed 's/^/::error::  /'
-      exit 1
+      loaderish=0
+      if [ "$esz" -eq 0 ]; then
+        loaderish=1                     # wine: silent on both streams
+      elif grep -qiE '\.dll|loading shared libraries|cannot open shared object' "$e"; then
+        loaderish=1                     # MSYS: names A dependency (not necessarily the right one)
+      fi
+      if [ "$loaderish" -eq 1 ]; then
+        echo "::error::$pe exited $rc having printed nothing on stdout."
+        echo "::error::That is STATUS_DLL_NOT_FOUND (0xC0000135): the loader could not find a"
+        echo "::error::dependency, so the process died before main() and never got to say so."
+        echo "::error::Do not read the exit code as the whole story -- from a Git-Bash parent"
+        echo "::error::the accompanying 'error while loading shared libraries' line names an"
+        echo "::error::ARBITRARY dependency, not the missing one (measured: libgcc_s_seh-1.dll"
+        echo "::error::every time, whichever DLL was actually removed)."
+        echo "::error::The import-closure gate should have caught this on the builder; if it"
+        echo "::error::did not, either the artifact lost a file in transit or the DLL is"
+        echo "::error::loaded at RUNTIME (LoadLibrary), which no import table records."
+        echo "::error::Shipped beside it:"
+        # shellcheck disable=SC2012  # these are DLL names, not arbitrary input
+        ls -1 "$(dirname "$pe")" | sed 's/^/::error::  /'
+        rm -f "$e"
+        exit 1
+      fi
+      if grep -qi '^wine:' "$e"; then
+        echo "::error::$pe exited $rc: wine itself refused to launch it (message above)."
+        echo "::error::A launch failure, but NOT the silent 0xC0000135 shape -- that one"
+        echo "::error::prints nothing at all under wine."
+      else
+        echo "::error::$pe exited $rc with no stdout, but its stderr above is not a"
+        echo "::error::loader failure -- it names no DLL, and a real 0xC0000135 either says"
+        echo "::error::nothing at all (wine) or names a dependency (MSYS). Read it as the"
+        echo "::error::program's own failure; this is NOT diagnosed as a missing DLL."
+      fi
+      rm -f "$e"
+      exit "$rc"
     fi ;;
 esac
+rm -f "$e"
 
 if [ "$rc" -eq 0 ] && [ "$osz" -eq 0 ] && [ "$esz" -eq 0 ] && [ -z "$RUN_ALLOW_SILENT" ]; then
   echo "::error::$pe exited 0 and printed nothing at all."

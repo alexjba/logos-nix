@@ -49,9 +49,15 @@ jobs:
         run default/bin/YOUR_TOOL.exe --version
 
       # ---- the knobs you will rarely touch --------------------------------
-      # min-pes: 1            floor on staged .exe/.dll; a headers+static-lib
-      #                       repo sets `min-pes: 0` AND `min-archives: 1`
-      # lgx-variant: false    set true if this repo emits a .lgx
+      # min-pes: 1            floor on staged loose .exe/.dll; a
+      #                       headers+static-lib repo sets `min-pes: 0` AND
+      #                       `min-archives: 1`, and a repo whose only Windows
+      #                       artifact is a .lgx sets `min-pes: 0` AND
+      #                       `lgx-variant: true`
+      # lgx-variant: false    set true if this repo emits a .lgx; it is a floor
+      #                       of its own (refuses a tree with no .lgx, a .lgx
+      #                       with no Windows variant, and a payload whose
+      #                       imports are not bundled with it)
       # native-smoke: true    run on a real windows-latest runner (free, ~2 min)
       # wine-smoke: true      run under wine first, for a faster red
       # cold-derivation-budget: 30

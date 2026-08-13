@@ -18,6 +18,14 @@ name: Windows fleet audit
 #
 # It also names the repos that have Linux+macOS CI and no Windows story at all,
 # so "we did not cover it" stays a decision on a list rather than an omission.
+#
+# THE THIRD BUCKET, AND WHY IT IS A FAILURE
+#   "Not audited" is a first-class outcome here, not a footnote. A repo whose
+#   flake fails to evaluate, whose eval times out, or whose contents probe comes
+#   back 403 has an UNKNOWN answer -- and an unknown that is silently filed as
+#   "no Windows target" is indistinguishable from a clean result while hiding
+#   exactly the drift this job exists to find. Anything not audited fails the
+#   job, as does a bucket count that does not add up to the repos listed.
 
 on:
   workflow_dispatch:
@@ -36,45 +44,140 @@ jobs:
       - name: Audit
         env:
           GH_TOKEN: ${{ github.token }}
+          # The org has ~60 unarchived repos. A listing far below this did not
+          # find a smaller org, it found a degraded API call.
+          MIN_REPOS: '20'
         run: |
-          set -uo pipefail
-          gh api --paginate 'orgs/logos-co/repos?per_page=100' \
-            --jq '.[] | select(.archived==false) | .name' | sort > repos.txt
-          echo "candidate repos: $(wc -l < repos.txt)"
+          # -e as well as -uo pipefail. Without it, `gh | sort > repos.txt`
+          # failing left an EMPTY repos.txt, the loop body never ran, drift.txt
+          # stayed empty and the job exited 0 having audited NOTHING. Measured
+          # on the shipped script with a `gh` that returns HTTP 403:
+          # "candidate repos: 0" and a green tick. A job that passes by skipping
+          # is worse than no job.
+          set -euo pipefail
 
-          : > covered.txt; : > drift.txt; : > noneed.txt; : > broken.txt
-          while read -r r; do
-            # Cheap pre-filter: no flake, nothing to evaluate.
-            gh api "repos/logos-co/$r/contents/flake.nix" >/dev/null 2>&1 || continue
-            if attrs=$(timeout 180 nix eval --raw "github:logos-co/$r#packages.x86_64-windows" \
-                         --apply 'x: builtins.concatStringsSep "," (builtins.attrNames x)' 2>/dev/null); then
-              if gh api "repos/logos-co/$r/contents/.github/workflows/windows.yml" >/dev/null 2>&1; then
-                echo "$r ($attrs)" >> covered.txt
-              else
-                echo "$r ($attrs)" >> drift.txt
-              fi
-            else
-              # Does it at least have Linux+macOS CI? Then it is a real gap,
-              # not merely an irrelevant repo.
-              if gh api "repos/logos-co/$r/contents/.github/workflows" --jq '.[].name' 2>/dev/null \
-                   | grep -q .; then
-                echo "$r" >> noneed.txt
-              fi
+          # gh's exit status alone cannot separate "this repo has no flake.nix"
+          # (404 -- a real answer) from "the call failed" (rate limit, token
+          # scope, network). Treating the second as the first is how an audit
+          # skips a repo, or the whole fleet, and still reports success. So
+          # classify on the HTTP status and give anything else its own bucket.
+          http_status() {
+            local out
+            out=$(gh api -i "$1" 2>/dev/null | head -1) || true
+            printf '%s' "$out" | sed -n 's|^HTTP/[0-9.]* \([0-9][0-9][0-9]\).*|\1|p'
+          }
+
+          if ! gh api --paginate 'orgs/logos-co/repos?per_page=100' \
+                 --jq '.[] | select(.archived==false) | .name' > repos.raw 2> gh.err; then
+            echo "::error::listing logos-co repos failed — this audit did not run."
+            echo "::error::It is reported RED rather than green-with-zero-findings on purpose:"
+            echo "::error::an empty listing and a clean fleet are indistinguishable downstream."
+            sed -n '1,20p' gh.err
+            exit 1
+          fi
+          LC_ALL=C sort -u repos.raw > repos.txt
+          # `wc -l <` pads its output on BSD; count() keeps every number bare so
+          # the arithmetic and the messages agree on non-GNU shells too.
+          count() { wc -l < "$1" | tr -d '[:space:]'; }
+          n_repos=$(count repos.txt)
+          echo "candidate repos: $n_repos"
+          if [ "$n_repos" -lt "$MIN_REPOS" ]; then
+            echo "::error::only $n_repos repos listed, floor is $MIN_REPOS."
+            echo "::error::The listing succeeded but returned implausibly little — a truncated"
+            echo "::error::page or a token that can only see part of the org. Audit not trusted."
+            exit 1
+          fi
+
+          : > covered.txt; : > drift.txt; : > noneed.txt
+          : > broken.txt; : > noflake.txt; : > outofscope.txt
+
+          # fd 3: `gh` and `nix` inside the body must not be able to eat the
+          # repo list off stdin.
+          while read -r r <&3; do
+            code=$(http_status "repos/logos-co/$r/contents/flake.nix")
+            case "$code" in
+              200) ;;
+              404) echo "$r" >> noflake.txt; continue ;;
+              *)   echo "$r — flake.nix probe returned HTTP ${code:-<no status line>}" >> broken.txt
+                   continue ;;
+            esac
+
+            set +e
+            attrs=$(timeout 180 nix eval --raw "github:logos-co/$r#packages.x86_64-windows" \
+                      --apply 'x: builtins.concatStringsSep "," (builtins.attrNames x)' 2> eval.err)
+            st=$?
+            set -e
+
+            if [ "$st" -eq 0 ]; then
+              code=$(http_status "repos/logos-co/$r/contents/.github/workflows/windows.yml")
+              case "$code" in
+                200) echo "$r ($attrs)" >> covered.txt ;;
+                404) echo "$r ($attrs)" >> drift.txt ;;
+                *)   echo "$r — has a Windows target; windows.yml probe returned HTTP ${code:-<no status line>}, so drift is UNKNOWN" >> broken.txt ;;
+              esac
+              continue
             fi
-          done < repos.txt
+
+            # A non-zero eval is not evidence of "no Windows target". Only one
+            # specific error means that; every other one -- a timeout, a broken
+            # flake, an unreachable input -- means this repo was NOT audited,
+            # and the shipped version filed all of them under "no Windows
+            # target" (measured: a repo whose flake fails to evaluate, and one
+            # whose eval times out, were both reported as out of scope).
+            if [ "$st" -eq 124 ]; then
+              echo "$r — nix eval timed out after 180s, not audited" >> broken.txt
+            elif grep -q 'does not provide attribute' eval.err; then
+              # Genuinely no Windows target. Does it at least have Linux+macOS
+              # CI? Then it is a real gap rather than an irrelevant repo.
+              code=$(http_status "repos/logos-co/$r/contents/.github/workflows")
+              case "$code" in
+                200) echo "$r" >> noneed.txt ;;
+                404) echo "$r" >> outofscope.txt ;;  # no CI at all: not a gap
+                *)   echo "$r — no Windows target; workflow listing returned HTTP ${code:-<no status line>}" >> broken.txt ;;
+              esac
+            else
+              echo "$r — nix eval failed: $(head -1 eval.err | cut -c1-160)" >> broken.txt
+            fi
+          done 3< repos.txt
+
+          # Every listed repo must have landed in exactly one bucket. This is
+          # the check that would have caught the failure above without anyone
+          # having to think of it: a repo that falls out of the loop silently
+          # is precisely a repo nobody audited.
+          n_cov=$(count covered.txt); n_drift=$(count drift.txt)
+          n_none=$(count noneed.txt); n_broken=$(count broken.txt)
+          n_noflake=$(count noflake.txt); n_oos=$(count outofscope.txt)
+          total=$((n_cov + n_drift + n_none + n_broken + n_noflake + n_oos))
 
           {
             echo "### Windows CI fleet audit"
             echo "| bucket | count |"; echo "|---|---|"
-            echo "| covered (target + caller) | $(wc -l < covered.txt) |"
-            echo "| **DRIFT (target, no caller)** | $(wc -l < drift.txt) |"
-            echo "| no Windows target | $(wc -l < noneed.txt) |"
+            echo "| covered (target + caller) | $n_cov |"
+            echo "| **DRIFT (target, no caller)** | $n_drift |"
+            echo "| no Windows target | $n_none |"
+            echo "| no flake — nothing to evaluate | $n_noflake |"
+            echo "| no CI at all — out of scope | $n_oos |"
+            echo "| **NOT AUDITED** | $n_broken |"
             echo; echo "#### Covered"; sed 's/^/- /' covered.txt
             echo; echo "#### Drift — these produce untested Windows artifacts"; sed 's/^/- /' drift.txt
             echo; echo "#### No Windows target (out of scope until ported)"; sed 's/^/- /' noneed.txt
+            echo; echo "#### Not audited — the answer for these repos is UNKNOWN, not 'fine'"
+            sed 's/^/- /' broken.txt
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -s drift.txt ]; then
-            while read -r l; do echo "::error::$l exposes packages.x86_64-windows but has no .github/workflows/windows.yml"; done < drift.txt
-            exit 1
+          rc=0
+          if [ "$total" -ne "$n_repos" ]; then
+            echo "::error::bucket accounting: $total classified vs $n_repos listed."
+            echo "::error::A repo left the loop without being filed anywhere, so this audit"
+            echo "::error::covered less than it claims. Refusing to report a result."
+            rc=1
           fi
+          while read -r l; do
+            echo "::error::NOT AUDITED: $l"
+          done < broken.txt
+          [ ! -s broken.txt ] || rc=1
+          while read -r l; do
+            echo "::error::$l exposes packages.x86_64-windows but has no .github/workflows/windows.yml"
+          done < drift.txt
+          [ ! -s drift.txt ] || rc=1
+          exit "$rc"
