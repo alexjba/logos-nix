@@ -87,6 +87,52 @@ in
   # covered by logos-co/nixpkgs@mingw-integration.
   cli11 = widenPlatforms prev.cli11;
 
+  # libpq is reachable for a Windows host, but only after four unrelated
+  # obstacles -- and every Logos repo that talks to postgres needs it, so it is
+  # fixed here rather than in each consumer.
+  #
+  # Note this is the CLIENT library only. Full `postgresql` (the server) has no
+  # mingw build in nixpkgs and is deliberately NOT made available: a module that
+  # wants postgres should declare `libpq`, which is all it ever links or
+  # dlopens anyway.
+  libpq =
+    let
+      base = prev.libpq.override {
+        # postgres 18 links libcurl for its OAuth device flow, and curl cross to
+        # mingw drags in ngtcp2 -> nghttp3, whose EXAMPLES include
+        # <arpa/inet.h> and fail to build. Nothing in Logos uses OAuth auth.
+        curlSupport = false;
+      };
+    in
+    widenPlatforms (base.overrideAttrs (old: {
+      # makeWrapper resolves to a HOST-platform bash, and mingw bash does not
+      # build. libpq never calls wrapProgram -- the hook is vestigial here.
+      nativeBuildInputs = builtins.filter
+        (d: !(lib.isDerivation d && (d.name or "") == "make-shell-wrapper-hook"))
+        (old.nativeBuildInputs or [ ]);
+
+      # src/port/pthread_barrier_wait.c includes <pthread.h> unconditionally via
+      # pg_pthread.h, but nixpkgs builds mingw-w64 against mcfgthread, which
+      # ships no pthreads at all. Same gap that makes Rust's windows-gnu std
+      # fail on -l:libpthread.a.
+      buildInputs = (old.buildInputs or [ ]) ++ [ final.windows.pthreads ];
+
+      # separateDebugInfo runs `objcopy --only-keep-debug`, the ELF split.
+      separateDebugInfo = false;
+    }));
+
+  # abseil-cpp's thread_identity.cc includes <pthread.h> unconditionally on any
+  # non-Windows-API path, and nixpkgs builds mingw-w64 against mcfgthread, which
+  # ships no pthreads. Same one-line gap as libpq above -- and the fifth place
+  # this particular mcfgthread hole has surfaced (libpq, Rust's windows-gnu std,
+  # lsquic's clock_gettime64, nim-boringssl, abseil).
+  #
+  # Reached transitively by any module that declares abseil-cpp in
+  # metadata nix.packages.runtime (logos-chat-ui does).
+  abseil-cpp = prev.abseil-cpp.overrideAttrs (old: {
+    buildInputs = (old.buildInputs or [ ]) ++ [ final.windows.pthreads ];
+  });
+
   # stduuid is header-only, so nothing of it should be COMPILED at all -- but
   # its CMakeLists defaults UUID_BUILD_TESTS to UUID_MAIN_PROJECT, which is ON
   # whenever it is the top-level project, i.e. always in nixpkgs. The test
