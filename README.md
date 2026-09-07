@@ -62,3 +62,44 @@ Previously, [`logos-cpp-sdk`](https://github.com/logos-co/logos-cpp-sdk) served 
 
 Then run `nix flake update` to re-lock.
 
+
+## iOS targets (`aarch64-ios-simulator`, `aarch64-ios`)
+
+Qt 6.11.1 built from source as static frameworks for the iOS simulator and for
+iOS devices, on the same cross pin as Windows. Only aarch64-darwin with Xcode installed can build it.
+
+```bash
+nix build .#packages.aarch64-ios-simulator.qtbase        # also qtdeclarative, qtshadertools, qtsvg
+nix build .#packages.aarch64-ios.qtbase                  # device (iphoneos SDK)
+nix build .#legacyPackages.aarch64-darwin.pkgsIosSimulator.qt6.qtbase   # the full cross sets: pkgsIosSimulator, pkgsIos
+```
+
+The pseudo-system is opt-in: `lib.forAllMobileTargets` iterates `lib.mobileTargets`
+(`aarch64-ios-simulator`, `aarch64-ios`; Android keys join the same list), while
+`lib.forAllTargets` stays native + Windows. A consumer gets `pkgs.logosQtCrossCmakeFlags`
+(appendable `-D` flags, `[]` natively) and `pkgs.logosQtCrossToolchainFile`
+(`qt.toolchain.cmake` of the iOS qtbase, to pass as `CMAKE_TOOLCHAIN_FILE`).
+
+An app's own static-archive stage is `pkgs.mkIosCmakeStage { pname; version; src;
+sourceDir ? "."; cmakeFlags ? []; buildInputs ? []; }`: the same Xcode-clang setup
+the Qt modules use (`nix/ios/xcode-clang.nix`), the toolchain file and cross flags
+applied, Qt on the path, and a post-install gate that fails on any dynamic image.
+
+**Purity boundary.** Everything iOS compiles with Xcode's clang and the
+iPhoneSimulator or iPhoneOS SDK from `/Applications/Xcode.app`, which cannot live in the
+store, so those derivations are `__noChroot`. They still produce
+ordinary cacheable store paths, but nothing iOS is bit-for-bit reproducible.
+The default macOS `sandbox = false` needs nothing; a machine with a strict
+sandbox must set `sandbox = relaxed`. An app's own Xcode-generator configure,
+`xcodebuild` and `xcrun simctl` steps against the store Qt stay outside nix.
+
+**Xcode gate.** `nix/ios/xcode-wrapper.nix` is named after the declared Xcode
+version and build (`iosXcodeVersion`/`iosXcodeBuild` in `flake.nix`), so they
+are in every dependent hash, and its setup hook fails any build early when the
+installed Xcode differs, naming both. Bumping Xcode means bumping those two
+strings and rebuilding Qt.
+
+**Prebuilt fallback.** If from-source ever breaks on a new Qt or Xcode, the
+documented fallback is Qt's official iOS archives as fixed-output fetches behind
+the same `packages.aarch64-ios*.*` names, moving all Xcode
+impurity into the app's link step. Not implemented: from-source works.

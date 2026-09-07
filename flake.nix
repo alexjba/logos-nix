@@ -70,6 +70,53 @@
       windowsCrossOverlay = import ./nix/windows/cross-overlay.nix;
       windowsNativeOverlay = import ./nix/windows/native-overlay.nix;
 
+      # iOS targets. Same cross pin as Windows (Qt 6.11.1); the Xcode version
+      # and build are part of every iOS derivation's hash via
+      # nix/ios/xcode-wrapper.nix. Only aarch64-darwin can build these.
+      # See nix/ios/cross-overlay.nix.
+      iosXcodeVersion = "26.6";
+      iosXcodeBuild = "17F113";
+      iosBuildSystems = [ "aarch64-darwin" ];
+      iosCrossSystems = {
+        aarch64-ios-simulator = {
+          config = "arm64-apple-ios";
+          darwinPlatform = "ios-simulator";
+        };
+        aarch64-ios = {
+          config = "arm64-apple-ios";
+          darwinPlatform = "ios";
+        };
+      };
+      iosCrossOverlay = import ./nix/ios/cross-overlay.nix;
+
+      mkIosPkgs =
+        { target ? "aarch64-ios-simulator"
+        , buildSystem ? "aarch64-darwin"
+        , xcodeVersion ? iosXcodeVersion
+        , xcodeBuild ? iosXcodeBuild
+        }: import nixpkgs-windows {
+          localSystem = buildSystem;
+          crossSystem = iosCrossSystems.${target} // { xcodeVer = xcodeVersion; inherit xcodeBuild; };
+          crossOverlays = [ iosCrossOverlay ];
+        };
+
+      # Mobile pseudo-systems are OPT-IN, unlike x86_64-windows: consumers
+      # that wrap forAllTargets map build systems for Windows only, and
+      # `stdenv.isDarwin` is true for an iOS host, so adding these keys to
+      # forAllTargets would misroute them. Android adds its keys here.
+      mobileTargets = {
+        aarch64-ios-simulator = {
+          buildSystem = "aarch64-darwin";
+          pkgs = mkIosPkgs { target = "aarch64-ios-simulator"; };
+        };
+        aarch64-ios = {
+          buildSystem = "aarch64-darwin";
+          pkgs = mkIosPkgs { target = "aarch64-ios"; };
+        };
+      };
+      forAllMobileTargets = f:
+        nixpkgs.lib.mapAttrs (system: t: f { inherit system; inherit (t) pkgs buildSystem; }) mobileTargets;
+
       # Native (Linux/macOS) package set on the workspace pin. Carries the
       # crates.io 403 fixes until the pin is bumped past NixOS/nixpkgs#512735
       # and #524979; see the two overlays under nix/overlays/.
@@ -151,11 +198,19 @@
           nativeOverlays
           windowsBuildSystems
           windowsCrossSystem
+          mkIosPkgs
+          iosBuildSystems
+          iosCrossSystems
+          iosXcodeVersion
+          iosXcodeBuild
+          mobileTargets
+          forAllMobileTargets
           ;
 
         overlays = {
           windows = windowsCrossOverlay;
           windowsNative = windowsNativeOverlay;
+          ios = iosCrossOverlay;
           fetchCargoVendorUserAgent = fetchCargoVendorUserAgentOverlay;
           importCargoLockStaticCratesIo = importCargoLockStaticCratesIoOverlay;
         };
@@ -165,7 +220,17 @@
       legacyPackages = nixpkgs.lib.genAttrs supportedSystems (system:
         (mkNativePkgs system) // {
           pkgsWindows = mkWindowsPkgs { buildSystem = system; };
+        } // nixpkgs.lib.optionalAttrs (builtins.elem system iosBuildSystems) {
+          pkgsIosSimulator = mkIosPkgs { buildSystem = system; };
+          pkgsIos = mkIosPkgs { buildSystem = system; target = "aarch64-ios"; };
         });
+
+      # nix build .#packages.aarch64-ios-simulator.qtbase (or aarch64-ios)
+      # Flat derivations only (flake schema); the full qt6 scope is under
+      # legacyPackages.<buildSystem>.pkgsIosSimulator / .pkgsIos like pkgsWindows.
+      packages = forAllMobileTargets ({ pkgs, ... }:
+        { inherit (pkgs.qt6) qtbase qtdeclarative qtshadertools qtsvg; }
+        // nixpkgs.lib.optionalAttrs (pkgs ? xcodeWrapper) { inherit (pkgs) xcodeWrapper; });
 
       # Drift guard for the Windows overlay.
       #
@@ -275,15 +340,15 @@
           # master applying to nothing.
           overlay-exports =
             let
-              windowsNames = [ "windows" "windowsNative" ];
-              nativeNames = builtins.attrNames (removeAttrs self.lib.overlays windowsNames);
+              crossNames = [ "windows" "windowsNative" "ios" ];
+              nativeNames = builtins.attrNames (removeAttrs self.lib.overlays crossNames);
             in
             assert lib.assertMsg
               (builtins.length self.lib.nativeOverlays == builtins.length nativeNames)
               ("overlay export drift: lib.nativeOverlays has "
                 + toString (builtins.length self.lib.nativeOverlays)
                 + " entries but lib.overlays lists " + toString (builtins.length nativeNames)
-                + " non-Windows overlays (" + toString nativeNames + ")");
+                + " non-cross overlays (" + toString nativeNames + ")");
             pkgs.runCommand "overlay-exports-eval-gate" { } "touch $out";
 
           import-cargo-lock-overlay =
@@ -340,7 +405,68 @@
             assert lib.assertMsg (((overlaid cross) lockArgs).outPath == (reference cross).outPath)
               "import-cargo-lock overlay drift: importCargoLock is not instantiated on the build platform";
             pkgs.runCommand "import-cargo-lock-overlay-eval-gate" { } "touch $out";
-        });
+        }
+        // lib.optionalAttrs (builtins.elem system iosBuildSystems) (
+          let
+            i = mkIosPkgs { buildSystem = system; };
+            d = mkIosPkgs { buildSystem = system; target = "aarch64-ios"; };
+            iosQtModules = [ "qtbase" "qtdeclarative" "qtshadertools" "qtsvg" ];
+            iosAssertions = [
+              {
+                name = "device set targets the iphoneos SDK and differs from the simulator";
+                ok = builtins.elem "-DCMAKE_OSX_SYSROOT=iphoneos" d.logosQtCrossCmakeFlags
+                  && d.qt6.qtbase.drvPath != i.qt6.qtbase.drvPath;
+              }
+              {
+                name = "all four Qt modules resolve";
+                ok = builtins.all (m: builtins.isString i.qt6.${m}.drvPath) iosQtModules;
+              }
+              # The version is the gate: a different declared Xcode must be a
+              # different derivation, or a cache hit from the wrong Xcode
+              # would be served as "the" Qt.
+              {
+                name = "xcode wrapper is named after the Xcode version and build";
+                ok = i.xcodeWrapper.name == "xcode-wrapper-${iosXcodeVersion}-${iosXcodeBuild}";
+              }
+              {
+                name = "declared Xcode version or build changes the Qt hash";
+                ok = (mkIosPkgs { buildSystem = system; xcodeVersion = "0.0"; }).qt6.qtbase.drvPath
+                  != i.qt6.qtbase.drvPath
+                  && (mkIosPkgs { buildSystem = system; xcodeBuild = "0A0"; }).qt6.qtbase.drvPath
+                  != i.qt6.qtbase.drvPath;
+              }
+              {
+                name = "cross flags carry host Qt and the simulator SDK";
+                ok = hasFlagPrefix { cmakeFlags = i.logosQtCrossCmakeFlags; } "-DQT_HOST_PATH="
+                  && builtins.elem "-DCMAKE_OSX_SYSROOT=iphonesimulator" i.logosQtCrossCmakeFlags;
+              }
+              {
+                name = "toolchain file lives in the iOS qtbase";
+                ok = lib.hasPrefix "${i.qt6.qtbase}" i.logosQtCrossToolchainFile;
+              }
+              # The overlay applied to a NATIVE set must degrade to nothing.
+              {
+                name = "cross flags are empty natively";
+                ok = (import nixpkgs-windows { inherit system; overlays = [ iosCrossOverlay ]; })
+                  .logosQtCrossCmakeFlags == [ ];
+              }
+              # Same silent failure as on Windows: aim at Qt6ShaderToolsTools
+              # (host qsb) or Qt Quick is quietly not built.
+              {
+                name = "qtdeclarative points at build-platform qsb";
+                ok = builtins.any (lib.hasSuffix "/lib/cmake/Qt6ShaderToolsTools") i.qt6.qtdeclarative.cmakeFlags;
+              }
+            ];
+            iosGate = lib.foldl'
+              (acc: a: acc && (lib.assertMsg a.ok "ios overlay drift: ${a.name}"))
+              true
+              iosAssertions;
+          in
+          {
+            ios-overlay = assert iosGate;
+              pkgs.runCommand "ios-overlay-eval-gate" { } "touch $out";
+          }
+        ));
 
       devShells = forAllSystems ({ pkgs, ... }: {
         default = pkgs.mkShell {
