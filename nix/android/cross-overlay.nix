@@ -403,6 +403,8 @@ lib.optionalAttrs isCross {
             "qtdeclarative"
             "qtshadertools"
             "qtsvg"
+            # repc, for consumers of Qt6RemoteObjects (liblogos_core).
+            "qtremoteobjects"
           ]
         ))
       # Consumed by qt_add_executable/qt_finalize_target to decide which ABIs to
