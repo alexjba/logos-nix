@@ -28,6 +28,7 @@ xcodeClang.mkDerivation (
       qt6.qtdeclarative
       qt6.qtshadertools
       qt6.qtsvg
+      qt6.qtremoteobjects
     ]
     ++ buildInputs;
 

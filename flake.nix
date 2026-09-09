@@ -316,7 +316,7 @@
       # mkQtAndroidApk are under legacyPackages.<buildSystem>.pkgsIosSimulator
       # / .pkgsIos / .pkgsAndroid like pkgsWindows.
       packages = forAllMobileTargets ({ pkgs, ... }:
-        { inherit (pkgs.qt6) qtbase qtdeclarative qtshadertools qtsvg; }
+        { inherit (pkgs.qt6) qtbase qtdeclarative qtshadertools qtsvg qtremoteobjects; inherit (pkgs) spdlog boost openssl libsodium; }
         // nixpkgs.lib.optionalAttrs (pkgs ? xcodeWrapper) { inherit (pkgs) xcodeWrapper; });
 
       # Drift guard for the Windows overlay.

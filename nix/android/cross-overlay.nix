@@ -344,8 +344,46 @@ lib.optionalAttrs isCross {
           "-DQt6ShaderToolsTools_DIR=${buildQt.qtshadertools}/lib/cmake/Qt6ShaderToolsTools"
         ])
       ) qprev.qtdeclarative;
+
+      # Qt Remote Objects for liblogos_core / logos-protocol; repc is a host
+      # tool, same trap as the Qml/Quick tools above.
+      qtremoteobjects = addCmakeFlags (
+        lib.optionals isCross [
+          "-DQt6RemoteObjectsTools_DIR=${buildQt.qtremoteobjects}/lib/cmake/Qt6RemoteObjectsTools"
+        ]
+      ) qprev.qtremoteobjects;
     }
   );
+
+  # ── liblogos_core's non-Qt tail ──────────────────────────────────────────
+  # spdlog's Android sink calls __android_log_write and nixpkgs links no -llog.
+  spdlog = prev.spdlog.overrideAttrs (old: {
+    env = (old.env or { }) // { NIX_LDFLAGS = "-llog"; };
+  });
+  # nixpkgs' b2 build of Boost fails for this target (`-lrt` from
+  # <target-os>linux; the NDK has no librt); Boost's own CMake build of the
+  # same version, static + PIC, only the libraries liblogos links.
+  boost = prev.stdenv.mkDerivation {
+    pname = "boost";
+    version = prev.boost.version;
+    src = buildPkgs.fetchurl {
+      url = "https://github.com/boostorg/boost/releases/download/boost-${prev.boost.version}/boost-${prev.boost.version}-cmake.tar.xz";
+      hash = "sha256-Z6zsAtDRGLXenrRB9ftwezoc3YhL4AyiS5pzyZVRH3Q=";
+    };
+    nativeBuildInputs = [ buildPkgs.cmake buildPkgs.ninja ];
+    cmakeFlags = [
+      "-DBOOST_INCLUDE_LIBRARIES=process;filesystem;system;asio;dll;uuid"
+      "-DBOOST_INSTALL_LAYOUT=system"
+      "-DBUILD_SHARED_LIBS=OFF"
+      "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
+      "-DBUILD_TESTING=OFF"
+      "-DBOOST_ENABLE_MPI=OFF"
+      "-DBOOST_ENABLE_PYTHON=OFF"
+    ];
+    postInstall = "cp -r ../libs/dll/include/boost/. $out/include/boost/";
+  };
+  # Header-only; platform-neutral.
+  cli11 = buildPkgs.cli11;
 }
 // {
   # CMAKE_TOOLCHAIN_FILE cannot be appended to an existing build tree's flags,

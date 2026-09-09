@@ -19,7 +19,9 @@ let
     "qtdeclarative"
     "qtshadertools"
     "qtsvg"
+    "qtremoteobjects"
   ];
+  iosDeploymentTarget = "17";
   prefixPath = scope: lib.concatStringsSep ";" (map (m: "${scope.${m}}") qtModules);
 in
 {
@@ -56,6 +58,24 @@ in
     inherit (final) xcodeClang logosQtCrossToolchainFile logosQtCrossCmakeFlags;
   };
 
+  # liblogos_core's non-Qt dependency tail, static, on Xcode's clang
+  # (nix/ios/third-party.nix says why nixpkgs' iOS stdenv is not used).
+  # Header-only packages come from the build platform unchanged.
+  inherit (import ./third-party.nix {
+    inherit lib appleSdk arch;
+    inherit (final) xcodeClang xcodeWrapper pkgsBuildBuild;
+    deploymentTarget = iosDeploymentTarget;
+    boostVersion = prev.boost.version;
+    opensslSrc = prev.openssl.src;
+    opensslVersion = prev.openssl.version;
+    spdlogSrc = prev.spdlog.src;
+    spdlogVersion = prev.spdlog.version;
+    libsodiumSrc = prev.libsodium.src;
+    libsodiumVersion = prev.libsodium.version;
+  }) spdlog boost openssl libsodium;
+  nlohmann_json = final.pkgsBuildBuild.nlohmann_json;
+  cli11 = final.pkgsBuildBuild.cli11;
+
   qt6 = prev.qt6.overrideScope (
     qfinal: qprev:
     let
@@ -79,6 +99,17 @@ in
       qtsvg = mkQtModule {
         pname = "qtsvg";
         qtDeps = [ qfinal.qtbase ];
+      };
+
+      # Qt Remote Objects: what logos-protocol's qt_remote transport and
+      # liblogos_core link. The repc host tool comes from the build-platform
+      # module, like qsb and qmltyperegistrar above.
+      qtremoteobjects = mkQtModule {
+        pname = "qtremoteobjects";
+        qtDeps = [ qfinal.qtbase ];
+        cmakeFlags = [
+          "-DQt6RemoteObjectsTools_DIR=${hostQt.qtremoteobjects}/lib/cmake/Qt6RemoteObjectsTools"
+        ];
       };
 
       qtdeclarative = mkQtModule {
